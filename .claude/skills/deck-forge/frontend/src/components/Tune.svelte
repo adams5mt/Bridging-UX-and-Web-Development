@@ -1,0 +1,998 @@
+<script>
+  import { api } from "../lib/api.js";
+  import { tryAdd } from "../lib/adds.js";
+  import {
+    isDigital,
+    applySnapshot,
+    hasCommander,
+    rejectedAdds,
+    wildcardBudget,
+    metaArchetype,
+  } from "../lib/store.js";
+  import { WC_TIERS } from "../lib/mana.js";
+  import { matchLabel, pct1 } from "../lib/cards.js";
+  import CardChip from "./CardChip.svelte";
+  import CardList from "./CardList.svelte";
+  import WildcardBudget from "./WildcardBudget.svelte";
+
+  // The deterministic Tune surface (ADR-0023): diagnose → cut candidates → budgeted
+  // swaps, all from the pure deterministic core (works with no session attached).
+  let budget = ""; // "" → owned-only zero-spend pass (paper / USD)
+  // Digital builds spend Arena wildcards, not dollars, and the four tiers aren't
+  // interchangeable — so the budget is four per-rarity quantities, the shared
+  // wildcardBudget store: seeded from the player's Arena wildcards when the hub can
+  // read them, else a default that reflects scarcity (commons/uncommons plentiful,
+  // rare/mythic dear); the user dials it. All-zero = owned-only.
+  let maxSwaps = 5;
+  let shapeOverride = ""; // "" → inferred
+  let suggestCommander = false;
+  let loading = false;
+  let applying = false;
+  let error = "";
+  // A refused swap's reason (the hub's rule text) — rendered beside the run button
+  // so it has a home whether or not the re-tune leaves any swaps to show.
+  let applyError = "";
+  let result = null;
+  // The add being rejected right now (its row shows "finding an alternative…"
+  // while the re-run sources the next candidate for that slot).
+  let rejecting = "";
+  // The adds a reject's re-run brought in that the previous list lacked — the
+  // rows that answer "what replaced it" — tagged until the next plain run.
+  let fresh = new Set();
+
+  const SHAPES = ["aggro", "midrange", "control", "combo"];
+
+  // Resolve the single cards we render directly (swap cut/add, commander suggestions).
+  let resolved = {};
+  const inflight = new Set();
+  async function resolveOne(n) {
+    if (!n || n in resolved || inflight.has(n)) return;
+    inflight.add(n);
+    const r = await api.card(n);
+    resolved = { ...resolved, [n]: r.ok && r.data ? r.data.card : null };
+    inflight.delete(n);
+  }
+  $: if (result) {
+    for (const s of result.swaps) {
+      if (s.cut) resolveOne(s.cut.name); // fills have no cut (pure add into an open slot)
+      resolveOne(s.add.name);
+    }
+    for (const s of result.size_cuts || []) resolveOne(s.name);
+    for (const c of result.commander_suggestions || []) resolveOne(c.name);
+  }
+
+  // Over-size cuts (E): the deck exceeds the format's legal size, so these are pure
+  // cut rows (no add side, never overlapping the swaps). The header borrows the CR
+  // citation from the backend's message ("… (CR 903.5a) — cut").
+  $: crCite =
+    (result?.size_cuts?.[0]?.message || "").match(/\(CR [^)]+\)/)?.[0] ?? "";
+
+  async function run() {
+    loading = true;
+    error = "";
+    fresh = new Set();
+    const body = {
+      max_swaps: Number(maxSwaps) || 0,
+      shape_override: shapeOverride || null,
+      suggest_commander: suggestCommander,
+      exclude: [...$rejectedAdds],
+      // The archetype pinned in the Meta panel, else the one the deck matches.
+      meta_archetype: $metaArchetype || null,
+    };
+    if ($isDigital) {
+      // Per-rarity wildcard allowance — the tuner gates each unowned add against the
+      // budget for that card's rarity (all-zero = owned-only).
+      // The store holds it cleaned (whole numbers ≥ 0).
+      body.wildcard_budget = { ...$wildcardBudget };
+    } else if (budget !== "" && !Number.isNaN(Number(budget))) {
+      body.budget = Number(budget);
+    }
+    const r = await api.tune(body);
+    if (!r.ok) {
+      const hint =
+        r.status === 404 || r.status === 405
+          ? " — restart the hub to load the Tune route"
+          : "";
+      error =
+        (r.data && r.data.error) || `Tune failed (HTTP ${r.status})${hint}`;
+      result = null;
+    } else {
+      result = r.data;
+    }
+    loading = false;
+  }
+
+  // Reject a proposed add: it is never proposed again for this build, and the
+  // re-run (deterministic, combos cached) fills the same slot with the next-ranked
+  // candidate while every other swap holds.
+  async function reject(s) {
+    if (applying || rejecting) return;
+    rejecting = s.add.name;
+    rejectedAdds.update((set) => new Set([...set, s.add.name]));
+    const before = new Set(result.swaps.map((x) => x.add.name));
+    try {
+      await run();
+      if (result)
+        fresh = new Set(
+          result.swaps.map((x) => x.add.name).filter((n) => !before.has(n)),
+        );
+    } finally {
+      rejecting = "";
+    }
+  }
+  async function unreject(name) {
+    if (applying || rejecting) return;
+    rejectedAdds.update((set) => {
+      const next = new Set(set);
+      next.delete(name);
+      return next;
+    });
+    if (result) await run();
+  }
+
+  async function applySwap(s) {
+    if (applying) return;
+    applying = true;
+    // Drop it from the list up front so it vanishes immediately and can't be applied
+    // twice (the old flow re-enabled the button before the slow re-tune finished, so a
+    // second click on the still-showing row double-added the card).
+    result = { ...result, swaps: result.swaps.filter((x) => x !== s) };
+    applyError = "";
+    try {
+      // applySnapshot keeps the deck list + footer live; a single apply skips the full
+      // re-tune (slow combos + search) so working through the list stays snappy — the
+      // scorecard refreshes on the next Run Tune.
+      applyError = await applyOne(s);
+    } finally {
+      applying = false;
+    }
+  }
+
+  // Apply one swap and return the hub's reason if any part was refused ("" when
+  // it went through). The ADD goes first: a swap whose add is refused must not
+  // cut its card, and goes back on the list for a retry.
+  async function applyOne(s) {
+    const why = await tryAdd(s.add.name, "cards");
+    if (why) {
+      result = { ...result, swaps: [s, ...result.swaps] };
+      return why;
+    }
+    if (!s.cut) return ""; // a fill only adds
+    const cut = await api.remove(s.cut.name);
+    if (cut.ok) {
+      applySnapshot(cut.data);
+      return "";
+    }
+    return cut.data.error || `couldn't cut ${s.cut.name}`;
+  }
+
+  // A size cut is just a removal — same path a swap's cut side takes. The row is
+  // dropped up front (same double-apply guard as applySwap) and the header's counts
+  // are kept honest locally; the next Run Tune re-derives them server-side.
+  async function applySizeCut(s) {
+    if (applying) return;
+    applying = true;
+    const size = result.scorecard.size;
+    result = {
+      ...result,
+      size_cuts: result.size_cuts.filter((x) => x !== s),
+      scorecard: {
+        ...result.scorecard,
+        size: {
+          ...size,
+          total: size.total - 1,
+          overflow: Math.max(0, size.overflow - 1),
+        },
+      },
+    };
+    applyError = "";
+    try {
+      const r = await api.remove(s.name);
+      if (r.ok) applySnapshot(r.data);
+      else applyError = r.data.error || `couldn't cut ${s.name}`;
+    } finally {
+      applying = false;
+    }
+  }
+
+  async function applyAll() {
+    if (applying) return;
+    applying = true;
+    applyError = "";
+    const refused = [];
+    try {
+      const swaps = result.swaps;
+      result = { ...result, swaps: [] };
+      for (const s of swaps) {
+        const why = await applyOne(s);
+        if (why) refused.push(why);
+      }
+      await run(); // one re-tune after the batch to refresh the scorecard + proposals
+      applyError = refused.join(" · "); // survives the re-tune
+    } finally {
+      applying = false;
+    }
+  }
+
+  const pct = (x) => Math.round((x || 0) * 100);
+  const WC_LETTER = { mythic: "M", rare: "R", uncommon: "U", common: "C" };
+
+  // Cost tag for a swap/commander entry. A swap add carries the backend's coverage
+  // (`covered_by` "free" / "owned", and `copies_short`); a commander suggestion carries
+  // `owned`. Paper: free / owned / $X. Digital: free / owned, or the wildcard the add
+  // costs ("1R") — rarity rides the swap add (backend), or the resolved card as a
+  // fallback. `digital` and `resolvedCard` are passed in (not closed over) so the
+  // {costTag(...)} markup expression tracks them as dependencies and re-renders when
+  // the medium toggles — Svelte doesn't trace a function body's reads.
+  function costTag(entry, digital, resolvedCard) {
+    if (entry.covered_by === "free") return "free";
+    if (entry.covered_by === "owned" || entry.owned) return "owned";
+    if (digital) {
+      // || not ??: the backend sends "" (not null) for a missing rarity, and no valid
+      // rarity is ever falsy — so empty-string must also fall through to the resolved card.
+      const rarity = entry.rarity || resolvedCard?.rarity;
+      const letter = WC_LETTER[rarity];
+      return letter ? `1${letter}` : "craft";
+    }
+    if (entry.cost == null) return "buy"; // commander suggestion carries no $ cost
+    return entry.cost === 0 ? "free" : `$${entry.cost}`;
+  }
+
+  // Wildcards the swaps STILL in the list cost, by tier (digital only) — each add's
+  // served `copies_short` of its rarity. Summed from the rows so the total stays in
+  // sync when a single Apply removes one, rather than reading the backend's now-stale
+  // full-batch wildcards_spent.
+  $: wcSpend = (result?.swaps ?? []).reduce(
+    (t, s) => {
+      if (s.add.rarity in t) t[s.add.rarity] += s.add.copies_short ?? 0;
+      return t;
+    },
+    { mythic: 0, rare: 0, uncommon: 0, common: 0 },
+  );
+  $: wcSpendTiers = WC_TIERS.filter(([k]) => wcSpend[k]).map(
+    ([k, label, cls]) => ({
+      label,
+      cls,
+      n: wcSpend[k],
+    }),
+  );
+</script>
+
+<div class="tune">
+  <div class="panel widget">
+    <h3 class="panel-title">Deterministic Tune</h3>
+    <p class="sub">
+      Evaluate efficiency, template fit &amp; focus, then propose budgeted
+      swaps.
+    </p>
+    <div class="grid">
+      {#if $isDigital}
+        <div class="wc-budget">
+          <span class="wc-budget-label"
+            >Wildcard budget <em>— what you'll craft, by rarity</em></span
+          >
+          <WildcardBudget layout="grid" />
+        </div>
+      {:else}
+        <label
+          >Budget ($)
+          <input
+            type="number"
+            min="0"
+            bind:value={budget}
+            placeholder="owned-only"
+          />
+        </label>
+      {/if}
+      <label
+        >Swaps
+        <input type="number" min="0" max="25" bind:value={maxSwaps} />
+      </label>
+      <label
+        >Shape
+        <select bind:value={shapeOverride}>
+          <option value="">inferred</option>
+          {#each SHAPES as s (s)}<option value={s}>{s}</option>{/each}
+        </select>
+      </label>
+      {#if $hasCommander}
+        <label class="check">
+          <input type="checkbox" bind:checked={suggestCommander} />
+          Suggest a better commander
+        </label>
+      {/if}
+    </div>
+    <button class="run" on:click={run} disabled={loading || applying}>
+      {loading ? "Tuning…" : "Run Tune"}
+    </button>
+    {#if error}<p class="err">{error}</p>{/if}
+    {#if applyError}<p class="err">{applyError}</p>{/if}
+  </div>
+
+  {#if result}
+    {@const sc = result.scorecard}
+    <div class="panel widget">
+      <div class="shape-row">
+        <span class="chip shape">{sc.shape.value}</span>
+        <span class="meta">{sc.shape.inferred ? "detected" : "override"}</span>
+      </div>
+      <div class="evidence">
+        {#each sc.shape.evidence as ev (ev.label)}
+          {#if ev.cards && ev.cards.length}
+            <CardList
+              names={ev.cards}
+              label={`${ev.label} `}
+              showCount={false}
+            />
+          {:else}
+            <span class="ev-flat">{ev.label}</span>
+          {/if}
+        {/each}
+      </div>
+
+      {#if sc.top_issues.length}
+        <ul class="issues">
+          {#each sc.top_issues as i (i.kind + i.message)}
+            <li><span class="sev">●</span>{i.message}</li>
+          {/each}
+        </ul>
+      {:else}
+        <p class="clean">No issues found — the deck reads clean.</p>
+      {/if}
+    </div>
+
+    <div class="panel widget">
+      <!-- Efficiency -->
+      <div class="metric">
+        <div class="m-head">
+          <span class="m-name">Efficiency</span>
+          <span class="m-verdict" class:ok={sc.efficiency.verdict === "ok"}>
+            {sc.efficiency.verdict}
+          </span>
+        </div>
+        <div class="m-line">
+          avg MV <b>{sc.efficiency.avg_mv.value}</b>
+          (band {sc.efficiency.avg_mv.band[0]}–{sc.efficiency.avg_mv.band[1]})
+        </div>
+        <div class="m-line">
+          ramp <b>{sc.efficiency.ramp.have}</b>/{sc.efficiency.ramp.want}
+          <CardList names={sc.efficiency.ramp.cards} label="" />
+        </div>
+        <div class="m-line">
+          top-end <b>{sc.efficiency.top_end.have}</b>
+          <CardList names={sc.efficiency.top_end.cards} label="" />
+        </div>
+      </div>
+
+      <!-- Template -->
+      <div class="metric">
+        <div class="m-head">
+          <span class="m-name">Template</span>
+          <span
+            class="m-verdict"
+            class:ok={sc.template.verdict === "on-template"}
+          >
+            {sc.template.verdict}
+          </span>
+        </div>
+        <div class="m-line">
+          {#each Object.entries(sc.template.short) as [role, b] (role)}
+            <span class="role-gap"
+              >{role.replace("_", " ")} <b>{b.current}</b>/{b.min}</span
+            >
+          {/each}
+          {#each Object.entries(sc.template.over) as [role, b] (role)}
+            <span class="role-gap over"
+              >{role.replace("_", " ")} <b>{b.current}</b> (max {b.max})</span
+            >
+          {/each}
+          {#if !Object.keys(sc.template.short).length && !Object.keys(sc.template.over).length}
+            all roles in band
+          {/if}
+        </div>
+      </div>
+
+      <!-- Focus -->
+      <div class="metric">
+        <div class="m-head">
+          <span class="m-name">Focus</span>
+          <span
+            class="m-verdict"
+            class:ok={sc.focus.verdict === "FOCUSED" ||
+              sc.focus.verdict === "SPINE-LED"}
+          >
+            {sc.focus.verdict}
+          </span>
+        </div>
+        <div class="m-line">
+          engine <b>{sc.focus.engine_pool}</b> · filler
+          <b>{pct(sc.focus.filler_rate)}%</b>
+          <CardList names={sc.focus.filler_cards || []} label="" />
+        </div>
+        {#if sc.focus.viable_avenues.length}
+          <div class="m-sub">themes</div>
+          {#each sc.focus.viable_avenues as a (a.label)}
+            <div class="m-line avenue">
+              <span class="tier {a.tier}">{a.tier}</span>
+              {a.label} <b>{a.depth}</b>
+              <CardList names={a.cards || []} label="" />
+            </div>
+          {/each}
+        {/if}
+        {#if sc.focus.emerging && sc.focus.emerging.length}
+          <div class="m-sub">under-supported — commit or cut</div>
+          {#each sc.focus.emerging as a (a.label)}
+            <div class="m-line avenue">
+              <span class="tier emerging">emerging</span>
+              {a.label} <b>{a.depth}</b>
+              <CardList names={a.cards || []} label="" />
+            </div>
+          {/each}
+        {/if}
+      </div>
+
+      <!-- Meta (ADR-0059): the deck's Arena meta archetype — null for a paper
+           build, an uncached queue, or no match -->
+      {#if sc.meta}
+        <div class="metric">
+          <div class="m-head">
+            <span class="m-name">Meta</span>
+            <span class="m-verdict" class:ok={!sc.meta.missing_core.length}>
+              {sc.meta.archetype.name}
+            </span>
+          </div>
+          <div class="m-line">
+            {matchLabel(sc.meta.match)}
+            · win <b>{pct1(sc.meta.archetype.winrate)}</b>
+          </div>
+          {#if sc.meta.missing_core.length}
+            <div class="m-line">
+              missing core
+              <CardList
+                names={sc.meta.missing_core.map((c) => c.name)}
+                label=""
+              />
+            </div>
+          {/if}
+          {#if sc.meta.low_share.length}
+            <div class="m-line">
+              rare in its lists (&lt; {pct1(sc.meta.cut_share)})
+              <CardList names={sc.meta.low_share} label="" />
+            </div>
+          {/if}
+        </div>
+      {/if}
+
+      <!-- Tier-2 advisory flags -->
+      <div class="flag-block">
+        <div class="flag-row" class:warn={sc.wincons.status === "low"}>
+          <span
+            >≈{sc.wincons.count} closers (wants {sc.wincons.target[0]}–{sc
+              .wincons.target[1]})</span
+          >
+          <CardList names={sc.wincons.cards || []} label="" />
+        </div>
+        {#if sc.protection.wants_protection}
+          <div class="flag-row" class:warn={sc.protection.status === "low"}>
+            <span
+              >{sc.protection.count} protection (wants ~{sc.protection
+                .target})</span
+            >
+            <CardList names={sc.protection.cards || []} label="" />
+          </div>
+        {/if}
+        {#if sc.commander_fit?.misfit}
+          <div class="flag-row warn">
+            <span
+              >commander serves {sc.commander_fit.serves_viable.length}/{sc
+                .commander_fit.viable_count} viable avenues</span
+            >
+          </div>
+        {/if}
+      </div>
+    </div>
+
+    {#if sc.size?.shortfall > 0}
+      <p class="note">
+        {sc.size.shortfall} card{sc.size.shortfall === 1 ? "" : "s"} short of
+        {sc.size.deck_size} — the swaps below fill open slots first.
+      </p>
+    {/if}
+    {#if result.size_cuts?.length && sc.size?.overflow > 0}
+      <div class="panel widget">
+        <h3 class="panel-title size-title">
+          {sc.size.overflow} over the legal {sc.size.deck_size}{crCite
+            ? ` ${crCite}`
+            : ""} — cut these
+        </h3>
+        {#each result.size_cuts as s (s.name)}
+          <div class="swap">
+            <div class="pair">
+              <span class="pm cut">−</span>
+              <CardChip
+                name={s.name}
+                card={resolved[s.name] ?? null}
+                clickable={false}
+              />
+            </div>
+            <div class="swap-meta">
+              <span class="why">{s.why}</span>
+              <button on:click={() => applySizeCut(s)} disabled={applying}
+                >Cut</button
+              >
+            </div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+
+    {#if result.swaps.length}
+      <div class="panel widget">
+        <div class="swap-head">
+          <h3 class="panel-title">Proposed changes</h3>
+          <button class="apply-all" on:click={applyAll} disabled={applying}>
+            Apply all ({result.swaps.length})
+          </button>
+        </div>
+        {#each result.swaps as s ((s.cut?.name ?? "") + "→" + s.add.name)}
+          <div class="swap" class:fresh={fresh.has(s.add.name)}>
+            <div class="pair">
+              <!-- A fill has no cut: it's a pure add into an open slot, shown as just "+ Card". -->
+              {#if s.cut}
+                <span class="pm cut">−</span>
+                <CardChip
+                  name={s.cut.name}
+                  card={resolved[s.cut.name] ?? null}
+                  clickable={false}
+                />
+                <span class="arrow">→</span>
+              {/if}
+              <span class="pm add">+</span>
+              <CardChip
+                name={s.add.name}
+                card={resolved[s.add.name] ?? null}
+                clickable={false}
+              />
+              <span class="tag"
+                >{costTag(s.add, $isDigital, resolved[s.add.name])}</span
+              >
+              {#if s.add.copy > 1}
+                <span class="tag" title="Which copy this add becomes"
+                  >copy {s.add.copy}</span
+                >
+              {/if}
+              {#if fresh.has(s.add.name)}
+                <span
+                  class="tag new"
+                  title="Proposed in place of a rejected card">new</span
+                >
+              {/if}
+            </div>
+            <div class="swap-meta">
+              <span class="why"
+                >{rejecting === s.add.name
+                  ? "finding an alternative…"
+                  : s.reason}</span
+              >
+              <button
+                class="reject"
+                title="Never propose {s.add
+                  .name}; show the next candidate for this slot"
+                on:click={() => reject(s)}
+                disabled={applying || !!rejecting}>Reject</button
+              >
+              <button
+                on:click={() => applySwap(s)}
+                disabled={applying || !!rejecting}>Apply</button
+              >
+            </div>
+          </div>
+        {/each}
+        {#if $isDigital}
+          <p class="spent">
+            Wildcards:
+            {#each wcSpendTiers as t (t.cls)}
+              <span class="wc-{t.cls}">{t.n}{t.label}</span>
+            {:else}
+              <span class="wc-owned">none — all owned</span>
+            {/each}
+          </p>
+        {:else}
+          <p class="spent">Spend: ${result.spent}</p>
+        {/if}
+      </div>
+    {/if}
+    {#if result.swaps_note}<p class="note">{result.swaps_note}</p>{/if}
+    {#if $rejectedAdds.size}
+      <p class="rejected">
+        Rejected:
+        {#each [...$rejectedAdds] as n (n)}
+          <button
+            type="button"
+            class="rejchip"
+            title="Allow {n} again"
+            on:click={() => unreject(n)}>{n} <em>✕</em></button
+          >
+        {/each}
+      </p>
+    {/if}
+
+    {#if result.commander_suggestions && result.commander_suggestions.length}
+      <div class="panel widget">
+        <h3 class="panel-title">Better-fit commanders</h3>
+        {#each result.commander_suggestions as c (c.name)}
+          <div class="cmd">
+            <div class="cmd-top">
+              <CardChip
+                name={c.name}
+                card={resolved[c.name] ?? null}
+                clickable={false}
+              />
+              <span class="tag">{costTag(c, $isDigital, resolved[c.name])}</span
+              >
+            </div>
+            <div class="cmd-meta">serves {c.serves.join(", ")}</div>
+            {#if c.identity_cost && c.identity_cost.length}
+              <CardList
+                names={c.identity_cost}
+                label="cards that fall out of identity: "
+              />
+            {/if}
+          </div>
+        {/each}
+      </div>
+    {/if}
+  {/if}
+</div>
+
+<style>
+  .tune {
+    display: flex;
+    flex-direction: column;
+    gap: 0.8rem;
+    overflow-y: auto;
+    height: 100%;
+  }
+  .sub {
+    font-size: 0.82rem;
+    color: var(--parchment-dim);
+    margin: 0 0 0.7rem;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.6rem 0.8rem;
+  }
+  label {
+    display: flex;
+    flex-direction: column;
+    font-size: 0.8rem;
+    color: var(--parchment);
+    gap: 0.2rem;
+  }
+  label.check {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.4rem;
+    grid-column: 1 / -1;
+  }
+  input,
+  select {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--hairline-soft);
+    border-radius: 4px;
+    color: var(--parchment);
+    padding: 0.35rem 0.45rem;
+    font-size: 0.9rem;
+  }
+  label.check input {
+    width: auto;
+  }
+  /* Digital wildcard budget — four per-rarity inputs (spans the grid row). */
+  .wc-budget {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+  .wc-budget-label {
+    font-size: 0.8rem;
+    color: var(--parchment);
+  }
+  .wc-budget-label em {
+    color: var(--parchment-dim);
+    font-style: normal;
+    font-size: 0.72rem;
+  }
+  button {
+    background: var(--brass);
+    color: #1a1206;
+    border: none;
+    border-radius: 5px;
+    padding: 0.4rem 0.8rem;
+    font-family: var(--display);
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .run {
+    margin-top: 0.8rem;
+    width: 100%;
+    padding: 0.55rem;
+    font-size: 0.95rem;
+  }
+  button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .err {
+    color: var(--fail, #e07a5f);
+    font-size: 0.85rem;
+    margin-top: 0.6rem;
+  }
+
+  /* Shape */
+  .shape-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .chip.shape {
+    background: var(--brass);
+    color: #1a1206;
+    border-radius: 999px;
+    padding: 0.18rem 0.8rem;
+    font-family: var(--display);
+    font-size: 1rem;
+    text-transform: capitalize;
+  }
+  .meta {
+    font-size: 0.72rem;
+    color: var(--parchment-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  .evidence {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    margin: 0.55rem 0;
+  }
+  .ev-flat {
+    font-size: 0.82rem;
+    color: var(--parchment-dim);
+  }
+
+  .issues {
+    list-style: none;
+    margin: 0.7rem 0 0;
+    padding: 0;
+  }
+  .issues li {
+    font-size: 0.9rem;
+    color: var(--parchment);
+    padding: 0.25rem 0;
+    line-height: 1.4;
+  }
+  .sev {
+    color: var(--brass-bright, #e8b04b);
+    margin-right: 0.45rem;
+    font-size: 0.7rem;
+    vertical-align: middle;
+  }
+  .clean {
+    color: var(--pass);
+    font-size: 0.9rem;
+  }
+
+  /* Metrics */
+  .metric {
+    margin-bottom: 0.85rem;
+    padding-bottom: 0.7rem;
+    border-bottom: 1px solid var(--hairline-soft);
+  }
+  .m-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 0.3rem;
+  }
+  .m-name {
+    font-family: var(--display);
+    color: var(--brass-bright, #e8b04b);
+    font-size: 1rem;
+  }
+  .m-verdict {
+    color: var(--fail, #e07a5f);
+    font-size: 0.9rem;
+    font-weight: 600;
+    text-transform: capitalize;
+  }
+  .m-verdict.ok {
+    color: var(--pass);
+  }
+  .m-line {
+    font-size: 0.85rem;
+    color: var(--parchment);
+    line-height: 1.5;
+  }
+  .m-line b {
+    color: var(--brass-bright, #e8b04b);
+    font-weight: 700;
+  }
+  .m-sub {
+    font-size: 0.74rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--parchment-dim);
+    margin-top: 0.4rem;
+  }
+  .avenue {
+    margin-top: 0.15rem;
+  }
+  .tier {
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    border-radius: 4px;
+    padding: 0.02rem 0.35rem;
+    margin-right: 0.35rem;
+    vertical-align: middle;
+  }
+  .tier.main {
+    background: var(--brass);
+    color: #1a1206;
+  }
+  .tier.sub {
+    border: 1px solid var(--hairline);
+    color: var(--parchment-dim);
+  }
+  .tier.emerging {
+    border: 1px dashed var(--brass);
+    color: var(--brass);
+  }
+  .role-gap {
+    margin-right: 0.7rem;
+  }
+  .role-gap.over b {
+    color: var(--fail, #e07a5f);
+  }
+
+  /* Tier-2 flags */
+  .flag-block {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-top: 0.2rem;
+  }
+  .flag-row {
+    font-size: 0.85rem;
+    color: var(--parchment-dim);
+  }
+  .flag-row.warn {
+    color: var(--brass-bright, #e8b04b);
+  }
+
+  /* Over-size cuts — same row anatomy as a swap's cut side, headed in the cut tone. */
+  .size-title {
+    color: var(--fail, #e07a5f);
+  }
+
+  /* Swaps */
+  .swap-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .swap {
+    border-top: 1px solid var(--hairline-soft);
+    padding: 0.55rem 0;
+  }
+  .pair {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+  }
+  .pm {
+    font-weight: 700;
+    font-size: 1rem;
+  }
+  .pm.cut {
+    color: var(--fail, #e07a5f);
+  }
+  .pm.add {
+    color: var(--pass);
+  }
+  .arrow {
+    color: var(--parchment-dim);
+    margin: 0 0.15rem;
+  }
+  .tag {
+    font-size: 0.7rem;
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: 4px;
+    padding: 0.05rem 0.4rem;
+    color: var(--parchment-dim);
+  }
+  .swap-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 0.35rem;
+  }
+  .why {
+    font-size: 0.78rem;
+    color: var(--parchment-dim);
+  }
+  .swap.fresh {
+    box-shadow: inset 0 0 0 1px var(--brass);
+  }
+  .tag.new {
+    color: var(--brass-bright);
+    border: 1px solid var(--brass);
+  }
+  .rejected {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.78rem;
+    color: var(--muted);
+    margin: 0.4rem 0 0;
+  }
+  .rejchip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.74rem;
+    color: var(--parchment-dim);
+    background: rgba(212, 69, 47, 0.12);
+    border: 1px solid rgba(212, 69, 47, 0.45);
+    border-radius: 999px;
+    padding: 0.12rem 0.55rem;
+    cursor: pointer;
+  }
+  .rejchip em {
+    font-style: normal;
+  }
+  .swap-meta button.reject {
+    color: var(--parchment-dim);
+    border-color: rgba(212, 69, 47, 0.45);
+  }
+  .swap-meta button {
+    padding: 0.2rem 0.6rem;
+    font-size: 0.78rem;
+  }
+  .spent {
+    font-size: 0.82rem;
+    color: var(--parchment-dim);
+    margin: 0.5rem 0 0;
+  }
+  /* Wildcard tier chips in the spend total — layout only; .wc-* globals tint them. */
+  .spent span {
+    margin-left: 0.4rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .note {
+    font-size: 0.8rem;
+    color: var(--parchment-dim);
+    font-style: italic;
+  }
+
+  /* Commander suggestions */
+  .cmd {
+    border-top: 1px solid var(--hairline-soft);
+    padding: 0.5rem 0;
+  }
+  .cmd-top {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .cmd-meta {
+    font-size: 0.8rem;
+    color: var(--parchment-dim);
+    margin: 0.25rem 0;
+  }
+</style>

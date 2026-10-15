@@ -1,0 +1,889 @@
+<script>
+  import {
+    deck,
+    applySnapshot,
+    importOpen,
+    collection,
+    activeTab,
+    isDigital,
+    hasCommander,
+    sideboardSize,
+    deckSizeDefault,
+    poolBounded,
+  } from "../lib/store.js";
+  import { api } from "../lib/api.js";
+  import { tryAdd } from "../lib/adds.js";
+  import { hoverPreview } from "../lib/hover.js";
+  import { displayName, heldCopies, canHoldAnother } from "../lib/cards.js";
+  import { wildcardLabel, wildcardTotals, WC_TIERS } from "../lib/mana.js";
+  import { facetOk, nameOk } from "../lib/filter.js";
+  import ManaCost from "./ManaCost.svelte";
+  import FilterWidget from "./FilterWidget.svelte";
+
+  // Live filtering of the current deck (A4) — the SAME widget Find uses, applied
+  // client-side over the loaded deck cards.
+  let fName = "";
+  let fType = "";
+  let fCmc = "";
+  let fPrice = "";
+  let fRarity = "";
+  let fOwned = false;
+
+  // One quiet inline error line for zone moves (the backend's message carries the CR
+  // citation — e.g. an occupied companion zone or a card with no companion ability).
+  let zoneError = "";
+
+  async function remove(name, zone) {
+    zoneError = "";
+    const r = await api.remove(name, zone, 1);
+    if (r.ok) applySnapshot(r.data);
+    else zoneError = r.data.error || "couldn't remove";
+  }
+
+  async function addOne(name, zone) {
+    zoneError = await tryAdd(name, zone);
+  }
+
+  // One-step zone move (main deck ⇄ sideboard, promote to commander, reveal as
+  // companion). The backend runs every rule BEFORE the session changes (CR 103.2b /
+  // 702.139a for the companion zone, a command zone the format has) and 400s with
+  // a cited message, so a refused move leaves the deck untouched — no restore dance.
+  async function moveOne(name, from, to) {
+    zoneError = "";
+    const r = await api.move(name, from, to, 1);
+    if (r.ok) applySnapshot(r.data);
+    else zoneError = r.data.error || `couldn't move to ${to}`;
+  }
+  // Promote a card already in the deck from the mainboard into the command zone
+  // (#1, ADR-0017) — the inverse of adding-as-commander. An imported list with no
+  // marked commander lands as a pile; ★ here moves a legendary into the command zone.
+  const promote = (name) => moveOne(name, "cards", "commanders");
+  const setCompanion = (name) => moveOne(name, "cards", "companion");
+
+  // Cheap client-side gate for the "Set as companion" affordance — every companion's
+  // oracle text opens a line with the Companion keyword; the backend stays the judge.
+  const looksCompanion = (c) => /(^|\n)Companion\b/.test(c.oracle_text || "");
+
+  // Printing picker (C): one open dropdown at a time, keyed by zone:name. Opening fetches
+  // the card's printings; choosing one (or "Default") pins it via the backend, which
+  // returns a fresh snapshot (image/price/export then follow the choice).
+  let pickerKey = null;
+  let pickerPrints = [];
+  let pickerLoading = false;
+  let pickerError = "";
+  const keyOf = (c, zone) => `${zone}:${c.name}`;
+  async function togglePicker(c, zone) {
+    const k = keyOf(c, zone);
+    if (pickerKey === k) {
+      pickerKey = null;
+      return;
+    }
+    pickerKey = k;
+    pickerPrints = [];
+    pickerError = "";
+    pickerLoading = true;
+    const r = await api.printings(c.name);
+    pickerLoading = false;
+    if (pickerKey === k) pickerPrints = r.ok ? r.data.printings : [];
+  }
+  async function choosePrinting(c, zone, id, finish = null) {
+    pickerError = "";
+    const r = await api.setPrinting(c.name, id, zone, finish);
+    if (!r.ok) {
+      // Finish validation (a printing never produced in foil/etched) 400s with a
+      // plain-language detail — keep the picker open and show it inline.
+      pickerError = r.data.error || `couldn't set printing (HTTP ${r.status})`;
+      return;
+    }
+    applySnapshot(r.data);
+    pickerKey = null;
+  }
+  const printPrice = (p) => (p.prices?.usd != null ? `$${p.prices.usd}` : "—");
+  // Foil / etched pin chips for a printing row — only finishes the printing was
+  // actually produced in, priced from the matching Scryfall price key when present.
+  function finishChips(p) {
+    return ["foil", "etched"]
+      .filter((f) => (p.finishes || []).includes(f))
+      .map((f) => {
+        const usd = f === "foil" ? p.prices?.usd_foil : p.prices?.usd_etched;
+        return { finish: f, price: usd != null ? `$${usd}` : "" };
+      });
+  }
+
+  // Cheapest USD listing for a card, or null (no-listing ≠ free — never shown as $0).
+  function priceOf(c) {
+    const p = c.prices?.usd ?? c.prices?.usd_foil ?? c.prices?.usd_etched;
+    const n = p == null ? null : Number(p);
+    return n == null || Number.isNaN(n) ? null : n;
+  }
+  const money = (n) => `$${n.toFixed(2)}`;
+
+  function groupTotal(cards) {
+    return cards.reduce(
+      (sum, c) => sum + (priceOf(c) ?? 0) * (c.quantity || 1),
+      0,
+    );
+  }
+
+  // Non-zero wildcard tiers for a group's subtotal in a digital build, e.g. [["rare",
+  // "R","rare"], …] paired with counts → "2R 5U". Empty when nothing needs crafting.
+  function wcSubtotal(cards) {
+    const totals = wildcardTotals(cards);
+    return WC_TIERS.filter(([k]) => totals[k]).map(([k, label, cls]) => ({
+      label,
+      cls,
+      n: totals[k],
+    }));
+  }
+
+  // Ownership tick title (tri-state, C): owned_printing true = the shown printing is
+  // owned; false = the card is owned but in a different printing (tick renders dimmed);
+  // absent = the collection has no printing detail (name-only — legacy title).
+  function ownedTitle(c) {
+    if (c.owned_printing === true) return "You own this printing";
+    if (c.owned_printing === false) return "Owned in another printing";
+    return `Owned ×${c.owned_qty}`;
+  }
+
+  // Effective deck-size target (Header/StatusBar read the same) — for the companion
+  // zone's "doesn't count toward your N" caption.
+  $: target = $deck.deck_size ?? $deckSizeDefault;
+  // The zones, by family: the Command Zone only where the format has one; the
+  // companion zone (D) right after it, only when occupied; the sideboard where the
+  // format has one (rendered even when empty, so its ⇄ affordance is discoverable —
+  // for a sealed / draft build it is the unused pool, derived and uncapped); the
+  // opened pool last, collapsed by default.
+  let poolOpen = false;
+  $: groups = [
+    ...($hasCommander
+      ? [{ key: "commanders", label: "Command Zone", cards: $deck.commanders }]
+      : []),
+    ...(($deck.companion || []).length
+      ? [{ key: "companion", label: "Companion", cards: $deck.companion }]
+      : []),
+    { key: "cards", label: "Deck", cards: $deck.cards },
+    ...($sideboardSize > 0
+      ? [
+          {
+            key: "sideboard",
+            label: $poolBounded ? "Sideboard — unused pool" : "Sideboard",
+            cards: $deck.sideboard || [],
+            cap: Number.isFinite($sideboardSize) ? $sideboardSize : null,
+          },
+        ]
+      : []),
+    ...($poolBounded
+      ? [
+          {
+            key: "pool",
+            label: "Pool",
+            cards: byColorThenCmc($deck.pool || []),
+          },
+        ]
+      : []),
+  ];
+  // Copies in a group (a 4-of is four cards, a singleton group reads as before).
+  const copies = (cards) =>
+    cards.reduce((sum, c) => sum + (c.quantity || 1), 0);
+  $: held = heldCopies($deck);
+  // Whether one more copy may be added: the served row's own copy limit (the pool's
+  // count for a sealed / draft build, whose derived sideboard is not "held").
+  function canAddAnother(c) {
+    const count = $poolBounded ? c.quantity || 1 : held.get(c.name) || 0;
+    return canHoldAnother(c, count);
+  }
+  // The pool reads colour then mana value (a booster's order says nothing).
+  function colorKey(c) {
+    return (c.color_identity || []).join("") || "~";
+  }
+  function byColorThenCmc(cards) {
+    return cards
+      .slice()
+      .sort(
+        (a, b) =>
+          colorKey(a).localeCompare(colorKey(b)) ||
+          (a.cmc || 0) - (b.cmc || 0) ||
+          a.name.localeCompare(b.name),
+      );
+  }
+  // Whether any filter is set (so we only show "N of M" and the clear hint when filtering).
+  $: filtering = !!(fName || fType || fCmc || fPrice || fRarity || fOwned);
+  // Filter each group client-side with the shared predicate. The facet values are read
+  // into the inline object HERE so Svelte tracks them as dependencies of this reactive.
+  $: filteredGroups = groups.map((g) => ({
+    ...g,
+    total: copies(g.cards),
+    cards: g.cards.filter(
+      (c) =>
+        nameOk(c, fName) &&
+        facetOk(
+          c,
+          {
+            type: fType,
+            cmc: fCmc,
+            price: fPrice,
+            rarity: fRarity,
+            owned: fOwned,
+          },
+          $isDigital,
+        ),
+    ),
+  }));
+  $: empty =
+    !$deck.commanders.length &&
+    !$deck.cards.length &&
+    !($deck.sideboard || []).length;
+  // The owned readout shows only when a Collection is loaded for the ACTIVE slot
+  // (strictly single-slot, ADR-0018) — otherwise there's nothing to compare against.
+  $: ownedReadout =
+    $collection && ($collection.slots?.[$collection.active_slot] || 0) > 0
+      ? $collection
+      : null;
+</script>
+
+<div class="panel deck">
+  <h3 class="panel-title">The Deck</h3>
+  {#if ownedReadout}
+    <div
+      class="owned-readout"
+      title="Owned in your {ownedReadout.active_slot} collection"
+    >
+      <span class="own-tick">✓</span>
+      {ownedReadout.owned} of {ownedReadout.deck_total} owned
+      <span class="own-slot">· {ownedReadout.active_slot}</span>
+    </div>
+  {/if}
+  {#if zoneError}
+    <div class="zone-err">{zoneError}</div>
+  {/if}
+
+  {#if empty}
+    <div class="cold">
+      <span class="glyph">🜂</span>
+      <p>
+        The forge is cold. {$hasCommander
+          ? "Search for a commander and add it to begin,"
+          : "Search for cards and add them to begin,"}
+      </p>
+      <p class="or">or bring a list you already have:</p>
+      <div class="cold-actions">
+        <button class="import-btn" on:click={() => importOpen.set(true)}
+          >⬇ Import a deck</button
+        >
+        {#if $hasCommander}
+          <button
+            class="import-btn ghost"
+            on:click={() => activeTab.set("commanders")}
+            >✦ Discover from your collection</button
+          >
+        {/if}
+      </div>
+    </div>
+  {:else}
+    <div class="deck-filter">
+      <FilterWidget
+        showName
+        bind:name={fName}
+        bind:facetType={fType}
+        bind:facetCmc={fCmc}
+        bind:facetPrice={fPrice}
+        bind:facetRarity={fRarity}
+        bind:facetOwned={fOwned}
+        digital={$isDigital}
+      />
+    </div>
+    {#each filteredGroups as g (g.key)}
+      {#if g.cards.length || (g.key === "sideboard" && !filtering)}
+        <div class="group">
+          <div class="group-head">
+            {#if g.key === "pool"}
+              <button
+                class="fold"
+                title={poolOpen ? "Collapse the pool" : "Show the pool"}
+                on:click={() => (poolOpen = !poolOpen)}
+                >{poolOpen ? "▾" : "▸"}</button
+              >
+            {/if}
+            {g.label}
+            <span class:over={g.cap && g.total > g.cap}
+              >· {filtering
+                ? `${copies(g.cards)} of ${g.total}`
+                : g.total}{g.cap ? `/${g.cap}` : ""}</span
+            >
+            {#if $isDigital}
+              <span
+                class="subtotal wc-sub"
+                title="Wildcards to craft this group"
+              >
+                {#each wcSubtotal(g.cards) as t (t.cls)}
+                  <span class="wc-{t.cls}">{t.n}{t.label}</span>
+                {:else}
+                  <span class="wc-owned">✓</span>
+                {/each}
+              </span>
+            {:else}
+              <span class="subtotal">{money(groupTotal(g.cards))}</span>
+            {/if}
+          </div>
+          {#if g.key === "companion"}
+            <div class="zone-note">
+              Revealed from outside the game — doesn't count toward your {target}
+            </div>
+          {/if}
+          {#if g.key === "sideboard" && !g.cards.length}
+            <div class="zone-note">
+              {$poolBounded
+                ? "Empty — every opened card is in the deck"
+                : "Empty — use ⇄ on a deck card, or SB on a Find result"}
+            </div>
+          {/if}
+          {#if g.key === "pool" && !poolOpen}
+            <div class="zone-note">
+              Your opened cards — the deck and sideboard are drawn from them
+            </div>
+          {/if}
+          {#each g.key === "pool" && !poolOpen ? [] : g.cards as c (c.name)}
+            <div class="row" use:hoverPreview={c}>
+              <div class="thumb">
+                {#if c.images?.small}
+                  <img src={c.images.small} alt={c.name} loading="lazy" />
+                {:else}
+                  <span class="noart">{c.name[0]}</span>
+                {/if}
+              </div>
+              <div class="info">
+                <div class="name">
+                  {displayName(c.name)}{#if c.owned}<span
+                      class="owned-tick"
+                      class:hollow={c.owned_printing === false}
+                      title={ownedTitle(c)}>✓</span
+                    >{/if}
+                </div>
+                <div class="type">
+                  {c.type_line || (c.unknown ? "unknown card" : "")}
+                </div>
+              </div>
+              <div class="right">
+                {#if c.quantity > 1}<span class="qty">×{c.quantity}</span>{/if}
+                {#if $isDigital}
+                  {@const wc = wildcardLabel(c)}
+                  <span class="wcprice wc-{wc.cls}" title={wc.title}
+                    >{wc.text}</span
+                  >
+                {:else if priceOf(c) != null}
+                  <span class="price">{money(priceOf(c))}</span>
+                {:else}
+                  <span
+                    class="price none"
+                    title="No listing — likely scarce/expensive, not free"
+                    >—</span
+                  >
+                {/if}
+                <span class="cost"
+                  ><ManaCost cost={c.mana_cost} size="0.82rem" /></span
+                >
+                {#if !c.unknown}
+                  {#if c.finish}
+                    <span
+                      class="finish-badge"
+                      title={c.finish === "etched" ? "Etched" : "Foil"}>✦</span
+                    >
+                  {/if}
+                  <button
+                    class="rm setbtn"
+                    class:pinned={c.printing_id}
+                    title={c.set
+                      ? `Printing: ${c.set.toUpperCase()} #${c.collector_number} — change`
+                      : "Choose printing"}
+                    on:click={() => togglePicker(c, g.key)}
+                    >{c.set ? c.set.toUpperCase() : "◆"}</button
+                  >
+                {/if}
+                {#if g.key === "cards" && $hasCommander && c.can_be_commander}
+                  <button
+                    class="rm star"
+                    title="Promote to commander"
+                    on:click={() => promote(c.name)}>★</button
+                  >
+                {/if}
+                {#if g.key === "cards" && !$poolBounded && looksCompanion(c)}
+                  <button
+                    class="rm star"
+                    title="Set as companion — revealed from outside the game"
+                    on:click={() => setCompanion(c.name)}>◈</button
+                  >
+                {/if}
+                {#if g.key === "cards" && $sideboardSize > 0}
+                  <button
+                    class="rm star"
+                    title={$poolBounded
+                      ? "Cut one to the unused pool"
+                      : "Move one to the sideboard"}
+                    on:click={() => moveOne(c.name, "cards", "sideboard")}
+                    >⇄</button
+                  >
+                {/if}
+                {#if g.key === "sideboard" || g.key === "pool"}
+                  <button
+                    class="rm star"
+                    title="Play one — move it to the main deck"
+                    on:click={() =>
+                      g.key === "pool"
+                        ? addOne(c.name, "cards")
+                        : moveOne(c.name, "sideboard", "cards")}>⇄</button
+                  >
+                {/if}
+                {#if (g.key === "cards" || (g.key === "sideboard" && !$poolBounded)) && canAddAnother(c)}
+                  <button
+                    class="rm add"
+                    title="Add another"
+                    on:click={() => addOne(c.name, g.key)}>+</button
+                  >
+                {/if}
+                {#if !(g.key === "sideboard" && $poolBounded)}
+                  <button
+                    class="rm"
+                    title={g.key === "pool"
+                      ? "Remove one from the pool"
+                      : "Remove one"}
+                    on:click={() => remove(c.name, g.key)}>−</button
+                  >
+                {/if}
+              </div>
+            </div>
+            {#if pickerKey === keyOf(c, g.key)}
+              <div class="printings">
+                {#if pickerLoading}
+                  <div class="pload">Loading printings…</div>
+                {:else}
+                  {#if c.owned_printing === false}
+                    <div class="pnote">
+                      You own this card in another printing
+                    </div>
+                  {/if}
+                  {#if pickerError}
+                    <div class="perr">{pickerError}</div>
+                  {/if}
+                  <div class="prow">
+                    <button
+                      class="pmain"
+                      class:on={!c.printing_id}
+                      on:click={() => choosePrinting(c, g.key, null)}
+                      use:hoverPreview={{
+                        name: c.name,
+                        images: c.images,
+                        layout: c.layout,
+                      }}
+                    >
+                      <span class="pset">Default (cheapest)</span>
+                    </button>
+                  </div>
+                  {#each pickerPrints as p (p.id)}
+                    <div class="prow">
+                      <button
+                        class="pmain"
+                        class:on={c.printing_id === p.id && !c.finish}
+                        on:click={() => choosePrinting(c, g.key, p.id)}
+                        use:hoverPreview={{
+                          name: c.name,
+                          images: p.images,
+                          layout: c.layout,
+                        }}
+                      >
+                        {#if p.owned_qty > 0}
+                          <span class="pown" title="You own {p.owned_qty}"
+                            >✓{p.owned_qty}</span
+                          >
+                        {/if}
+                        {#if p.owned_foil_qty > 0}
+                          <span
+                            class="pown"
+                            title="You own {p.owned_foil_qty} foil"
+                            >✦{p.owned_foil_qty}</span
+                          >
+                        {/if}
+                        <span class="pset"
+                          >{p.set?.toUpperCase()} · #{p.collector_number}</span
+                        >
+                        <span class="pmeta">{p.set_name}</span>
+                        <span class="pprice">{printPrice(p)}</span>
+                      </button>
+                      {#each finishChips(p) as f (f.finish)}
+                        <button
+                          class="pfoil"
+                          class:on={c.printing_id === p.id &&
+                            c.finish === f.finish}
+                          title="Pin this printing as {f.finish}"
+                          on:click={() =>
+                            choosePrinting(c, g.key, p.id, f.finish)}
+                          >✦ {f.finish}{f.price ? ` ${f.price}` : ""}</button
+                        >
+                      {/each}
+                    </div>
+                  {/each}
+                  {#if !pickerPrints.length}
+                    <div class="pload">No printings found.</div>
+                  {/if}
+                {/if}
+              </div>
+            {/if}
+          {/each}
+        </div>
+      {/if}
+    {/each}
+    {#if filtering && filteredGroups.every((g) => !g.cards.length)}
+      <div class="nomatch">No cards in the deck match this filter.</div>
+    {/if}
+  {/if}
+</div>
+
+<style>
+  .deck-filter {
+    margin: 0.25rem 0 0.7rem;
+  }
+  .nomatch {
+    color: var(--muted);
+    font-style: italic;
+    font-size: 0.85rem;
+    padding: 0.6rem 0.2rem;
+  }
+  .deck {
+    padding: 1rem;
+    height: 100%;
+    overflow-y: auto;
+  }
+  .cold {
+    text-align: center;
+    color: var(--muted);
+    padding: 3rem 1rem;
+  }
+  .cold .glyph {
+    font-size: 2.6rem;
+    display: block;
+    margin-bottom: 0.7rem;
+    opacity: 0.6;
+  }
+  .group-head {
+    font-family: var(--display);
+    font-size: 0.74rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--parchment-dim);
+    margin: 0.8rem 0 0.4rem;
+  }
+  .group-head span {
+    color: var(--muted);
+  }
+  .group-head .over {
+    color: var(--fail);
+  }
+  .fold {
+    background: transparent;
+    border: none;
+    color: var(--brass);
+    font-size: 0.9rem;
+    padding: 0 0.2rem 0 0;
+    cursor: pointer;
+  }
+  .group-head .subtotal {
+    float: right;
+    color: var(--brass);
+    letter-spacing: 0.04em;
+  }
+  .price {
+    font-size: 0.78rem;
+    color: var(--pass);
+    font-variant-numeric: tabular-nums;
+  }
+  .price.none {
+    color: var(--muted);
+    font-style: italic;
+  }
+  /* Wildcard cost (digital) — layout only; the .wc-* global classes supply the tint. */
+  .wcprice {
+    font-size: 0.78rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .wc-sub {
+    display: inline-flex;
+    gap: 0.32rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.32rem 0.3rem;
+    border-radius: var(--radius);
+    animation: rise 0.25s ease both;
+  }
+  .row:hover {
+    background: rgba(255, 220, 160, 0.04);
+  }
+  .thumb {
+    width: 34px;
+    height: 34px;
+    border-radius: 4px;
+    overflow: hidden;
+    flex-shrink: 0;
+    background: #0d0a08;
+    border: 1px solid var(--hairline-soft);
+    display: grid;
+    place-items: center;
+  }
+  .thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: center 18%;
+  }
+  .noart {
+    font-family: var(--display);
+    color: var(--brass);
+  }
+  .info {
+    flex: 1;
+    min-width: 0;
+  }
+  .name {
+    font-size: 0.92rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .type {
+    font-size: 0.72rem;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .right {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .qty {
+    font-size: 0.78rem;
+    color: var(--parchment-dim);
+  }
+  .cost {
+    display: flex;
+    justify-content: flex-end;
+    min-width: 2.2rem;
+  }
+  .rm {
+    background: transparent;
+    border: 1px solid var(--hairline-soft);
+    color: var(--parchment-dim);
+    border-radius: 4px;
+    width: 1.5rem;
+    height: 1.5rem;
+    line-height: 1;
+    font-size: 1.1rem;
+  }
+  .rm:hover {
+    border-color: var(--fail);
+    color: var(--fail);
+  }
+  .rm.add:hover {
+    border-color: var(--brass);
+    color: var(--brass-bright);
+  }
+  .rm.star {
+    font-size: 0.95rem;
+  }
+  .rm.star:hover {
+    border-color: var(--brass);
+    color: var(--brass-bright);
+  }
+  /* printing picker (C): the set-code chip + its dropdown of printings */
+  .rm.setbtn {
+    width: auto;
+    min-width: 1.5rem;
+    padding: 0 0.3rem;
+    font-size: 0.6rem;
+    font-family: var(--display);
+    letter-spacing: 0.04em;
+  }
+  .rm.setbtn.pinned {
+    border-color: var(--brass);
+    color: var(--brass-bright);
+  }
+  .rm.setbtn:hover {
+    border-color: var(--brass);
+    color: var(--brass-bright);
+  }
+  .printings {
+    margin: 0.15rem 0 0.5rem 2.6rem;
+    max-height: 14rem;
+    overflow-y: auto;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    background: rgba(0, 0, 0, 0.25);
+  }
+  .pload {
+    padding: 0.5rem 0.6rem;
+    font-size: 0.78rem;
+    color: var(--muted);
+    font-style: italic;
+  }
+  /* A printing row is a flex wrapper (not itself a button — the foil chip is a second
+     button and buttons can't nest): .pmain is the nonfoil pick, .pfoil the finish pin. */
+  .prow {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    border-bottom: 1px solid var(--hairline-soft);
+    padding-right: 0.45rem;
+  }
+  .prow:hover {
+    background: rgba(255, 220, 160, 0.06);
+  }
+  .pmain {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    flex: 1;
+    min-width: 0;
+    text-align: left;
+    background: none;
+    border: none;
+    color: var(--parchment-dim);
+    padding: 0.32rem 0.6rem;
+    cursor: pointer;
+    font-size: 0.78rem;
+  }
+  .pmain:hover {
+    color: var(--parchment);
+  }
+  .pmain.on {
+    color: var(--brass-bright);
+  }
+  .pfoil {
+    flex-shrink: 0;
+    background: none;
+    border: 1px solid var(--hairline-soft);
+    border-radius: 999px;
+    color: var(--parchment-dim);
+    font-size: 0.68rem;
+    padding: 0.05rem 0.45rem;
+    cursor: pointer;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .pfoil:hover,
+  .pfoil.on {
+    border-color: var(--brass);
+    color: var(--brass-bright);
+  }
+  /* per-printing owned marks — same green tick language as the deck rows */
+  .prow .pown {
+    color: var(--pass);
+    font-size: 0.68rem;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .pnote {
+    padding: 0.35rem 0.6rem 0.1rem;
+    font-size: 0.72rem;
+    color: var(--muted);
+    font-style: italic;
+  }
+  .perr {
+    padding: 0.35rem 0.6rem 0.1rem;
+    font-size: 0.72rem;
+    color: var(--fail);
+  }
+  .prow .pset {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .prow .pmeta {
+    flex: 1;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .prow .pprice {
+    color: var(--pass);
+    font-variant-numeric: tabular-nums;
+  }
+  .cold .or {
+    margin-top: 0.4rem;
+    font-size: 0.85rem;
+  }
+  .import-btn {
+    margin-top: 0.8rem;
+    padding: 0.5rem 1.2rem;
+    background: rgba(200, 150, 75, 0.08);
+    border: 1px solid var(--brass);
+    border-radius: 999px;
+    color: var(--brass-bright);
+    font-family: var(--display);
+    font-size: 0.82rem;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+  }
+  .import-btn:hover {
+    background: rgba(255, 106, 61, 0.12);
+    border-color: var(--brass-bright);
+  }
+  .cold-actions {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .import-btn.ghost {
+    background: transparent;
+    border-color: var(--hairline);
+    color: var(--parchment-dim);
+  }
+  .import-btn.ghost:hover {
+    color: var(--brass-bright);
+    border-color: var(--brass);
+  }
+  .owned-readout {
+    font-size: 0.74rem;
+    color: var(--pass);
+    margin: 0.15rem 0 0.3rem;
+    letter-spacing: 0.02em;
+  }
+  .owned-readout .own-tick {
+    margin-right: 0.2rem;
+  }
+  .owned-readout .own-slot {
+    color: var(--muted);
+    text-transform: capitalize;
+  }
+  .owned-tick {
+    color: var(--pass);
+    font-size: 0.72rem;
+    margin-left: 0.35rem;
+    vertical-align: middle;
+  }
+  /* Owned, but not in the shown printing — dimmed tick (title carries the detail). */
+  .owned-tick.hollow {
+    opacity: 0.45;
+  }
+  /* Foil / etched pin — quiet spark beside the set chip (title says which). */
+  .finish-badge {
+    color: var(--brass-bright);
+    font-size: 0.72rem;
+  }
+  .zone-note {
+    font-size: 0.72rem;
+    color: var(--muted);
+    font-style: italic;
+    margin: -0.2rem 0 0.4rem;
+  }
+  .zone-err {
+    font-size: 0.78rem;
+    color: var(--fail);
+    margin: 0.15rem 0 0.3rem;
+  }
+</style>

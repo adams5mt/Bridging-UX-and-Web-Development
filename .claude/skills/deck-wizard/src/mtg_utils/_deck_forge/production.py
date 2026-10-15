@@ -1,0 +1,295 @@
+"""Production wiring: build a ``ForgeState`` from the one ``CardPool`` (ADR-0046).
+
+If no bulk data is on disk, the state degrades to an agent-less, search-disabled
+mode (``bulk_available=False``) so the hub still starts and the search endpoint can
+fail loudly with a "run download-mtgjson" message rather than silently returning empty.
+"""
+
+from __future__ import annotations
+
+import functools
+import json
+import sys
+import threading
+import uuid
+from collections.abc import Callable, Mapping
+from pathlib import Path
+
+from mtg_utils import card_search, combo_search, mark_owned, ownership, theme_presets
+from mtg_utils._deck_forge import collection
+from mtg_utils._deck_forge.collection import CollectionStore
+from mtg_utils._deck_forge.persistence import BuildStore
+from mtg_utils._deck_forge.state import DeckSession, ForgeState
+from mtg_utils._http import cache_root
+from mtg_utils.card_pool import CardPool, NoBulkError
+from mtg_utils.hydrated_deck import HydratedDeck
+
+#: The combo lookups this process has already made, by deck content — a Tune
+#: re-run on an unchanged deck (a rejected add, a changed budget) is a live
+#: Commander Spellbook call otherwise. Bounded; the oldest entry goes first.
+_COMBO_MEMO: dict[str, dict] = {}
+_COMBO_MEMO_SIZE = 16
+
+
+def warm_at_launch(
+    state: ForgeState, reporter: Callable[[str, str, int, int], None]
+) -> threading.Thread | None:
+    """Launch-time process wiring for the hub's long jobs: install ``reporter`` as
+    ``state.report_busy`` and as the signals-index build's process hook
+    (``signals_index.set_progress_hook`` — the deck-forge process has one state to
+    report into), then run the warm chain in a daemon thread — the signals-index
+    seed (the one-time build, or the sidecar load), then the commander-discovery
+    caches for the active Collection slot — so both happen while the builder reads
+    the page instead of inside their first Find or Commanders request. A request
+    that needs the index meanwhile waits on the same build
+    (``theme_presets._SEED_LOCK``). No bulk: nothing to warm. Returns the thread
+    (None without bulk) so a caller can join it."""
+    from mtg_utils._analysis import signals_index
+    from mtg_utils._deck_forge import discovery, engine
+
+    state.report_busy = reporter
+    signals_index.set_progress_hook(
+        functools.partial(
+            reporter, engine.SIGNALS_INDEX_JOB, engine.SIGNALS_INDEX_LABEL
+        )
+    )
+    if not state.bulk_available or state.bulk_path is None:
+        return None
+
+    def chain() -> None:
+        # Best effort, never fatal: a failure here costs the first request its
+        # head start, nothing more — say so and carry on to the next step.
+        try:
+            theme_presets.seed_signal_key_index(state.bulk_path)
+        except Exception as exc:  # noqa: BLE001
+            print(f"deck-forge: signals-index warm failed: {exc}", file=sys.stderr)
+        try:
+            discovery.warm(state, state.active_slot, fmt=state.session.format)
+        except Exception as exc:  # noqa: BLE001
+            print(f"deck-forge: discovery warm failed: {exc}", file=sys.stderr)
+
+    thread = threading.Thread(target=chain, name="deck-forge-warm", daemon=True)
+    thread.start()
+    return thread
+
+
+def _combos(deck: dict, by_name: Mapping[str, dict]) -> dict:
+    # Build a HydratedDeck so combo_search can validate template requirements
+    # (e.g. "a Persist Creature") against the deck — without records, near-miss
+    # detection falls back to counting named cards only and over-reports near-misses.
+    key = json.dumps(deck, sort_keys=True, default=str)
+    hit = _COMBO_MEMO.get(key)
+    if hit is not None:
+        return hit
+    result = combo_search.combo_search(HydratedDeck.from_parsed(deck, by_name))
+    if len(_COMBO_MEMO) >= _COMBO_MEMO_SIZE:
+        del _COMBO_MEMO[next(iter(_COMBO_MEMO))]
+    _COMBO_MEMO[key] = result
+    return result
+
+
+def _deck_forge_dir() -> Path:
+    return cache_root() / "deck-forge"
+
+
+def _builds_dir() -> Path:
+    return _deck_forge_dir() / "builds"
+
+
+def resume_or_new(store: BuildStore, fmt: str) -> tuple[DeckSession, str, str]:
+    """Resume the most recent saved build, or start a fresh one. Returns
+    (session, build_id, build_name). Auto-resume means relaunching continues your
+    deck instead of minting a new 'Untitled' every time."""
+    builds = store.list()  # newest first
+    if builds:
+        record = store.load(builds[0]["id"])
+        if record is not None:
+            return (
+                DeckSession.from_deck_dict(record.get("deck") or {}),
+                record.get("id", builds[0]["id"]),
+                record.get("name", "Untitled"),
+            )
+    return DeckSession(fmt), uuid.uuid4().hex[:8], "Untitled"
+
+
+def _no_search(**_: object) -> list[dict]:
+    return []
+
+
+def _load_collections(
+    store: CollectionStore,
+    name_aliases: dict[str, str] | None = None,
+) -> tuple[dict[str, dict], dict[str, tuple]]:
+    """Load both Collection slots and precompute each slot's ownership lookup once, so a
+    per-snapshot ownership check stays O(deck size) (ADR-0018). ``name_aliases`` (built
+    from bulk) threads Arena printed_name / flavor_name matching into the lookup."""
+    # Drop quantity-0 (un-owned / wishlist) rows up front so size, ownership, and
+    # discovery all see owned-only — even for collections saved before this rule.
+    collections = {
+        slot: collection.owned_only(pile) for slot, pile in store.load().items()
+    }
+    index = {
+        slot: mark_owned.owned_lookup(pile, name_aliases=name_aliases or None)
+        for slot, pile in collections.items()
+    }
+    return collections, index
+
+
+def _ensure_sidecar(
+    *,
+    loader: Callable[[], object],
+    builder: Callable[[], tuple[Path, dict]],
+    label: str,
+    build_cmd: str,
+) -> bool:
+    """Shared ensure-idempotent-or-build machinery for the Card IR sidecar
+    builder. ``loader`` raises ``FileNotFoundError`` (absent) / ``ValueError``
+    (stale on-disk version) exactly like the sidecar loader it wraps; a clean
+    load means nothing to do. A build failure (no phase card-data reachable)
+    warns loudly and returns ``False`` — NON-BLOCKING, never a hard crash."""
+    from mtg_utils._analysis.lanes import SERVED_SIGNAL_KEYS
+
+    try:
+        loader()  # present + current version → nothing to do (idempotent)
+    except FileNotFoundError:
+        reason = "missing"  # absent sidecar — first run / never built
+    except ValueError:
+        reason = "stale"  # present but wrong on-disk version — phase/schema bump
+    else:
+        return True
+
+    try:
+        _out, stats = builder()
+    except (FileNotFoundError, RuntimeError):
+        # card-data couldn't be obtained (download failed / unreachable) → the
+        # sidecar can't be built. Do NOT silently degrade: name the cost (N
+        # crosswalk-served lanes) and the fix.
+        print(
+            f"deck-forge: WARNING — {label}Card IR sidecar unavailable "
+            f"({len(SERVED_SIGNAL_KEYS)} crosswalk signal lanes degraded). "
+            f"card-data download failed; re-run `{build_cmd}` with network "
+            "access. Building continues; those lanes stay dark until then.",
+            file=sys.stderr,
+        )
+        return False
+    else:
+        print(
+            f"deck-forge: built {label}Card IR sidecar ({reason}) — "
+            f"{stats['cards']} cards, phase {stats['phase_tag']}.",
+            file=sys.stderr,
+        )
+        return True
+
+
+def ensure_crosswalk_card_ir() -> bool:
+    """Ensure the crosswalk-backed Card IR sidecar exists at launch, building
+    it if absent/stale — the ONE production build (ADR-0039 task #80 step 6:
+    the ``MTG_SKILLS_CROSSWALK_SIGNALS`` flag and the legacy revert path it
+    gated are gone; :func:`ensure_card_ir` is now a thin alias for this).
+
+    ``_ir_lookup.ir_for`` (the compat-Card resolver: ``cut_check`` / ``ranking`` /
+    ``budgets`` /
+    the engine / ``_tuner`` bracket-metrics-tune, plus the deck-signals /
+    deck-rank / deck-tune CLIs) reads THIS sidecar: with no sidecar it returns
+    ``None`` per card rather than silently cross-wiring to a different
+    builder's Cards. This ensure pays the build cost once at launch (mirrors
+    the ``download-mtgjson`` ensure) so the common case never leaves the
+    compat-Card resolver dark.
+
+    IDEMPOTENT + fast: a right-on-disk-version sidecar is a single
+    ``load_crosswalk_card_ir`` (memoized) and returns ``True`` without
+    rebuilding. A missing/stale sidecar is rebuilt from phase's
+    ``card-data.json`` via ``build-card-ir-crosswalk``. When phase isn't
+    installed, it CANNOT be built — so we surface a loud, actionable warning
+    naming the degraded lanes and proceed NON-BLOCKING (returns ``False``).
+    Returns whether the sidecar is present after the call."""
+    from mtg_utils._card_ir.build import build_crosswalk_sidecar
+    from mtg_utils._card_ir.load import load_crosswalk_card_ir
+
+    return _ensure_sidecar(
+        loader=load_crosswalk_card_ir,
+        builder=build_crosswalk_sidecar,
+        label="crosswalk ",
+        build_cmd="build-card-ir-crosswalk",
+    )
+
+
+def ensure_card_ir() -> bool:
+    """Ensure the crosswalk-backed Card IR sidecar exists at launch (ADR-0027;
+    ADR-0039 task #80 step 6). Every existing call site (``default_state``, and
+    the ``deck-signals`` / ``deck-rank`` / ``deck-tune`` CLIs) calls this ONE
+    function; it is a thin alias for :func:`ensure_crosswalk_card_ir` kept for
+    those call sites' import stability now that the legacy revert path
+    (``ensure_legacy_card_ir``, flag-gated) is gone. Returns whether the
+    sidecar is present after the call."""
+    return ensure_crosswalk_card_ir()
+
+
+def default_state(fmt: str = "commander") -> ForgeState:
+    """Build the live backend state, loading bulk data when available."""
+    ensure_card_ir()  # build/refresh the Card IR sidecar (ADR-0027); never blocks
+    store = BuildStore(_builds_dir())
+    session, build_id, build_name = resume_or_new(store, fmt)
+    collection_store = CollectionStore(_deck_forge_dir() / "collection.json")
+    by_name: Mapping[str, dict] = {}
+    search = _no_search
+    available = False
+    object_resolver: Callable[[str], dict | None] | None = None
+    printings_by_oracle: dict[str, list[dict]] = {}
+    printing_by_id: dict[str, dict] = {}
+    # Built from bulk so the Collection's ownership matching honors Arena printed_name /
+    # flavor_name aliases (ADR-0018). Empty without bulk → DFC-only matching (fine).
+    name_aliases: dict[str, str] = {}
+    unreleased_ids: frozenset[str] = frozenset()
+    bulk_path: Path | None = None
+    try:
+        # ONE owner of the bulk and every index over it (ADR-0046); the state's
+        # fields below are its projections, so app.py / engine.py read as before.
+        pool = CardPool.load()
+    except NoBulkError:
+        pool = None
+    if pool is not None and pool.path is not None:
+        bulk_path = pool.path
+        by_name = pool.by_name
+        object_resolver = pool.resolve_object
+        printings_by_oracle = pool.printings_by_oracle
+        printing_by_id = pool.printing_by_id
+        # Shares card_search's (path, mtime) memo, so the Find surface's first
+        # include-unreleased request doesn't pay a second whole-bulk pass.
+        unreleased_ids = pool.unreleased_ids
+
+        # partial keeps search_cards's typed keyword signature (a `**kwargs:
+        # object` wrapper would widen every arg to `object` and fail the checker).
+        search = functools.partial(card_search.search_cards, bulk_path)
+
+        name_aliases = pool.name_aliases
+        available = True
+
+    collections, collection_index = _load_collections(collection_store, name_aliases)
+    # Per-printing ownership detail (sparse): entries without detail — every
+    # collection.json saved before printing-awareness — simply contribute nothing,
+    # so old files load as name-only ownership with no printing marks.
+    collection_printings = {
+        slot: ownership.printing_index(pile) for slot, pile in collections.items()
+    }
+
+    return ForgeState(
+        by_name=by_name,
+        search_fn=search,
+        session=session,
+        bulk_available=available,
+        unreleased_ids=unreleased_ids,
+        combos_fn=lambda deck: _combos(deck, by_name),
+        store=store,
+        build_id=build_id,
+        build_name=build_name,
+        collection_store=collection_store,
+        collections=collections,
+        collection_index=collection_index,
+        collection_printings=collection_printings,
+        name_aliases=name_aliases,
+        bulk_path=bulk_path if available else None,
+        object_resolver=object_resolver,
+        printings_by_oracle=printings_by_oracle,
+        printing_by_id=printing_by_id,
+    )

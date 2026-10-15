@@ -1,0 +1,622 @@
+"""Build the committed test snapshot (``tests/fixtures/card_snapshot.json``).
+
+Gated like ``download-mtgjson`` / ``build-card-ir-crosswalk``: needs the local MTGJSON
+bulk AND phase's ``card-data.json`` (auto-fetched from the pinned release tarball —
+no cargo), and is NEVER run in CI (CI consumes the committed snapshot offline). It
+collects the card names the tests reference via the ``mtg_utils.testkit`` helpers,
+resolves each to its GAMEPLAY printing, and emits, per card, a minimal Scryfall
+record plus its RAW phase face records (ADR-0039 task #80 step 5) — exactly the
+records ``mtg_utils._card_ir.trees.trees_for`` strict-loads in production, so
+``testkit`` builds the SAME ``ConceptTree`` / compat ``Card`` on demand with **no**
+phase cache / network in CI. This replaces the pre-step-5 shape (a single baked
+``project_card`` IR slice per card): the crosswalk world derives its IR from the
+typed substrate at read time, not at snapshot-build time, so the snapshot only needs
+to carry the INPUT (phase's own parse) rather than a stale baked OUTPUT.
+
+Self-validation (the field-completeness guard): for every card it asserts the signals
+of the MINIMAL record equal the signals of the FULL bulk record (both over the SAME
+seeded concept trees, via the production ``extract_signals``). A mismatch
+fails loudly with the card + the differing signals so the minimal field list is
+expanded rather than a lossy slice silently shipped.
+
+Modes:
+  * default — AST-scan the test tree for ``test_card`` / ``test_card_ir`` /
+    ``test_signals`` / ``test_phase_records`` usage: direct string-literal calls,
+    parametrize columns that feed such a call through a bare variable, and
+    ``_REAL_CASES`` name tables (usage-derived; the snapshot only holds cards a
+    test actually asks for), plus every theme preset's ``should_match`` /
+    ``should_not_match`` read from the registry itself (a preset fixture is
+    proven against the snapshot's real record, never hand-typed text) and every
+    ledgered bridge's pin.
+  * ``--names "A,B"`` / ``--names-file PATH`` — an explicit name list (additive to the
+    scan unless ``--no-scan``).
+
+ADR-0039 step 7: the ADR-0032 ``parse_metrics.json`` side-artifact (two
+``compute_parse_metrics`` cuts over the LEGACY ``project_card`` IR) was retired
+with the legacy builder — this script now writes only the snapshot itself.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+from collections import defaultdict
+from pathlib import Path
+
+from mtg_utils._analysis.signals import extract_signals
+from mtg_utils._card_ir.build import _group_by_oracle_id
+from mtg_utils._card_ir.load import CROSSWALK_SIDECAR_VERSION
+from mtg_utils._card_ir.trees import build_trees, seed_trees
+from mtg_utils._phase import PHASE_TAG, ensure_card_data
+from mtg_utils.bulk_loader import default_bulk_path, load_bulk_cards
+from mtg_utils.names import normalize_card_name
+from mtg_utils.testkit import SCHEMA_VERSION, snapshot_path
+
+# The minimal Scryfall fields the signal/serve path reads. Validated by the
+# per-card signals(minimal) == signals(full) assertion below; expand this (not a
+# silent fallback) if that assertion ever fires. ``all_parts`` carries token subtypes
+# the tribal type_matters subject reads (Flourishing Defenses → Elf).
+_SCRY_FIELDS = (
+    "oracle_id",
+    "name",
+    "oracle_text",
+    "type_line",
+    "keywords",
+    "mana_cost",
+    "cmc",
+    "power",
+    "toughness",
+    "loyalty",
+    "defense",
+    "produced_mana",
+    "color_identity",
+    "colors",
+    "legalities",
+    "arena_available",
+    "layout",
+    "card_faces",
+    "all_parts",
+)
+_FACE_FIELDS = (
+    "name",
+    "oracle_text",
+    "type_line",
+    "mana_cost",
+    "power",
+    "toughness",
+    "loyalty",
+    "defense",
+    "keywords",
+    "colors",
+)
+
+# The snapshot-feeding core: the four testkit entry points. Per-suite wrappers
+# that forward a card name into them (``_ks_real("Atraxa, …")``, ``_keys(…)`` —
+# the name literal sits on the wrapper, not on ``test_signals``) are DERIVED per
+# module by ``_local_wrappers``, never hand-listed: a hardcoded wrapper list
+# silently dropped any new helper a test file introduced (2026-07-25 — the
+# carried-forward names in older snapshots were masking exactly that gap).
+# The scan is AST-based (see ``_scan_module``), so apostrophes in names,
+# comments mentioning ``test_card("…")``, and parametrize tables all behave
+# correctly — a regex scan mis-handled all three.
+_CORE_HELPERS = frozenset(
+    {
+        "test_card",
+        "test_card_ir",
+        "test_signals",
+        "test_phase_records",
+        "test_printing",
+        "mtgjson_printing",
+    }
+)
+
+
+def _call_name(call: ast.Call) -> str | None:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _helper_call_name(call: ast.Call, helpers: frozenset[str]) -> str | None:
+    """The called helper's bare name, when the call targets the helper family."""
+    name = _call_name(call)
+    return name if name in helpers else None
+
+
+def _call_name_arg(call: ast.Call) -> ast.expr | None:
+    """The expression carrying a helper call's single ``name`` argument: the
+    first positional arg if present, else the ``name=`` keyword arg — every
+    core testkit helper (and every wrapper seen in practice) takes exactly one
+    parameter named ``name``, so a keyword forward (``test_signals(name=n)``)
+    or keyword literal (``test_card(name="Sol Ring")``) resolves the same way
+    a first-positional call does. Returns ``None`` when neither form matches
+    (e.g. the call passes no args at all)."""
+    if call.args:
+        return call.args[0]
+    for kw in call.keywords:
+        if kw.arg == "name":
+            return kw.value
+    return None
+
+
+def _local_wrappers(tree: ast.Module) -> frozenset[str]:
+    """Names of module-local functions that forward a parameter into the testkit
+    core (or into another wrapper) — computed to a fixpoint so a wrapper of a
+    wrapper still feeds the scan. A forward is recognized as either a bare
+    first-positional arg or a ``name=`` keyword arg (see ``_call_name_arg``); a
+    TRANSFORMED forward (``test_card(n.strip())``, ``test_card(name=n.strip())``)
+    is out of scope — only a bare variable reference is resolved."""
+    helpers = set(_CORE_HELPERS)
+    fns = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for fn in fns:
+            if fn.name in helpers:
+                continue
+            params = {a.arg for a in fn.args.args}
+            forwards = any(
+                isinstance(call, ast.Call)
+                and _call_name(call) in helpers
+                and isinstance((arg := _call_name_arg(call)), ast.Name)
+                and arg.id in params
+                for call in ast.walk(fn)
+            )
+            if forwards:
+                helpers.add(fn.name)
+                changed = True
+    return frozenset(helpers)
+
+
+def _parametrize_argnames(node: ast.expr) -> list[str]:
+    """The argname list of a ``pytest.mark.parametrize`` first argument — either
+    the comma-string form (``"name,wanted"``) or a tuple/list of strings."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [a.strip() for a in node.value.split(",")]
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return [
+            e.value
+            for e in node.elts
+            if isinstance(e, ast.Constant) and isinstance(e.value, str)
+        ]
+    return []
+
+
+def _literal_or_none(node: ast.expr) -> object:
+    try:
+        return ast.literal_eval(node)
+    except ValueError:
+        return None
+
+
+def _parametrize_rows(node: ast.expr) -> list[tuple]:
+    """The rows of a ``parametrize`` argvalues list, each normalized to a tuple
+    (scalars become 1-tuples; ``pytest.param(...)`` rows contribute their
+    positional args). A cell that isn't a literal — a predicate passed beside the
+    card name, ``("Xathrid Demon", has_selfloss_engine)`` — reads as ``None``, so
+    the row's literal name column is still harvested."""
+    if not isinstance(node, (ast.Tuple, ast.List)):
+        return []
+    rows: list[tuple] = []
+    for elt in node.elts:
+        target = elt
+        if (
+            isinstance(elt, ast.Call)
+            and isinstance(elt.func, ast.Attribute)
+            and elt.func.attr == "param"
+        ):
+            target = ast.Tuple(elts=list(elt.args), ctx=ast.Load())
+        if isinstance(target, ast.Tuple):
+            rows.append(tuple(_literal_or_none(e) for e in target.elts))
+        else:
+            rows.append((_literal_or_none(target),))
+    return rows
+
+
+def _parametrized_helper_names(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef, helpers: frozenset[str]
+) -> set[str]:
+    """Card names flowing into a helper call through a ``parametrize`` column: when
+    the test body calls ``test_card(name)`` with a bare variable and ``name`` is a
+    parametrize argname, harvest exactly that column's string values — so a
+    parametrized name table feeds the snapshot the same way a literal call does."""
+    fed = {
+        arg.id
+        for call in ast.walk(fn)
+        if isinstance(call, ast.Call)
+        and _helper_call_name(call, helpers)
+        and isinstance((arg := _call_name_arg(call)), ast.Name)
+    }
+    if not fed:
+        return set()
+    names: set[str] = set()
+    for dec in fn.decorator_list:
+        if not (
+            isinstance(dec, ast.Call)
+            and isinstance(dec.func, ast.Attribute)
+            and dec.func.attr == "parametrize"
+            and len(dec.args) >= 2
+        ):
+            continue
+        argnames = _parametrize_argnames(dec.args[0])
+        rows = _parametrize_rows(dec.args[1])
+        for var in fed.intersection(argnames):
+            col = argnames.index(var)
+            names.update(
+                row[col] for row in rows if col < len(row) and isinstance(row[col], str)
+            )
+    return names
+
+
+def _scan_module(text: str) -> set[str]:
+    """Every card name a test module asks the testkit for: direct helper-call
+    literals, parametrize columns feeding a helper call, and ``_REAL_CASES``
+    key→name table values."""
+    names: set[str] = set()
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return names
+    helpers = _local_wrappers(tree)
+    for node in ast.walk(tree):
+        is_helper_call = isinstance(node, ast.Call) and _helper_call_name(node, helpers)
+        if is_helper_call:
+            arg = _call_name_arg(node)
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                names.add(arg.value)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(
+                isinstance(t, ast.Name) and t.id == "_REAL_CASES" for t in targets
+            ) and isinstance(node.value, ast.Dict):
+                names.update(
+                    v.value
+                    for v in node.value.values
+                    if isinstance(v, ast.Constant) and isinstance(v.value, str)
+                )
+        elif isinstance(node, ast.For):
+            # ``for n in ("Card A", "Card B"): … helper(n)`` — a literal loop
+            # tuple feeding a helper call through the loop variable.
+            if (
+                isinstance(node.target, ast.Name)
+                and isinstance(node.iter, (ast.Tuple, ast.List))
+                and any(
+                    isinstance(call, ast.Call)
+                    and _helper_call_name(call, helpers)
+                    and isinstance((arg := _call_name_arg(call)), ast.Name)
+                    and arg.id == node.target.id
+                    for call in ast.walk(node)
+                )
+            ):
+                names.update(
+                    e.value
+                    for e in node.iter.elts
+                    if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                )
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.update(_parametrized_helper_names(node, helpers))
+    return names
+
+
+def _minimal(card: dict) -> dict:
+    out = {k: card[k] for k in _SCRY_FIELDS if k in card}
+    if "card_faces" in out:
+        out["card_faces"] = [
+            {k: f[k] for k in _FACE_FIELDS if k in f} for f in out["card_faces"]
+        ]
+    return out
+
+
+# The test trees the usage scan reads, relative to the repo root.
+# Every skill's tests: ADR-0056 applies to all of them, so a real card any test
+# names must be captured, not only deck-forge's and mtg-utils'.
+TEST_DIRS = ("tests",)
+# Source labels for the two name sources the AST scan cannot see.
+PRESET_SOURCE = "theme_presets (fixture)"
+LEDGER_SOURCE = "bridge_ledger (pin)"
+
+
+def usage_scan_dirs(repo_root: Path) -> list[Path]:
+    """The :data:`TEST_DIRS` under ``repo_root`` (named so pytest never collects
+    it: a ``test_``-prefixed function imported into a test module would be)."""
+    return [repo_root / d for d in TEST_DIRS]
+
+
+def _test_file_usage(dirs: list[Path]) -> dict[str, set[Path]]:
+    """Usage-derived names, each with the test modules that ask for it: direct
+    ``test_card(...)`` literals, parametrize columns feeding a helper call, and
+    every value in a ``_REAL_CASES`` key→name table. So adding a parametrize row
+    (and re-running) grows the snapshot with no external name list.
+    ``conftest.py`` modules are scanned too: a shared fixture that builds real
+    cards by name feeds the snapshot like a test does."""
+    usage: dict[str, set[Path]] = {}
+    for d in dirs:
+        if not d.exists():
+            continue
+        for py in (*d.rglob("test_*.py"), *d.rglob("conftest.py")):
+            for name in _scan_module(py.read_text(encoding="utf-8")):
+                usage.setdefault(name, set()).add(py)
+    return usage
+
+
+def scan_test_usage(repo_root: Path) -> dict[str, tuple[str, ...]]:
+    """Every card name the snapshot is derived from → where it comes from: the
+    test modules that name it (repo-relative paths), :data:`PRESET_SOURCE` for a
+    theme-preset fixture, :data:`LEDGER_SOURCE` for a bridge-ledger pin.
+    ``main`` snapshots exactly these names and ``bump-phase-pin`` reads their
+    provenance — so "a test names this card" means one thing to both."""
+    usage: dict[str, set[str]] = {
+        name: {str(p.relative_to(repo_root)) for p in paths}
+        for name, paths in _test_file_usage(usage_scan_dirs(repo_root)).items()
+    }
+    for name in _preset_fixture_names():
+        usage.setdefault(name, set()).add(PRESET_SOURCE)
+    for name in _bridge_pin_names():
+        usage.setdefault(name, set()).add(LEDGER_SOURCE)
+    return {name: tuple(sorted(srcs)) for name, srcs in usage.items()}
+
+
+def _preset_fixture_names() -> set[str]:
+    """Every ``should_match`` / ``should_not_match`` name in the theme-preset
+    registry: a preset's fixtures are proven against the snapshot's REAL records
+    (keywords + oracle text as the bulk carries them, never hand-typed —
+    ``tests/mtg-utils/test_theme_presets.py``), so the registry is a name source
+    of its own — the AST scan cannot see a comprehension over imported data."""
+    from mtg_utils.theme_presets import PRESETS
+
+    return {
+        card
+        for preset in PRESETS.values()
+        for card in (*preset.should_match, *preset.should_not_match)
+    }
+
+
+def _bridge_pin_names() -> set[str]:
+    """Every ledgered bridge's convergence pin (ADR-0048): ``test_bridge_ledger``
+    parametrizes over the ledger itself, so — like the preset registry — the
+    ledger is a name source the AST scan cannot see."""
+    from mtg_utils._analysis.bridge_ledger import BRIDGES
+
+    return {pin for bridge in BRIDGES.values() for pin in bridge.pins}
+
+
+def _existing_names(out_path: Path) -> set[str]:
+    """Card names already committed in *out_path*, or empty if it doesn't
+    exist / doesn't parse. The AST scan is necessarily incomplete — a table
+    built from a dynamic comprehension over imported registry data has no
+    string literal for the scanner to find at all (the preset registry is
+    read directly, :func:`_preset_fixture_names`; any other such table is
+    not). Regenerating must never silently drop a name the scan can't see;
+    ``--prune`` opts into that instead of it happening by accident."""
+    if not out_path.exists():
+        return set()
+    try:
+        payload = json.loads(out_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return set()
+    cards = payload.get("cards")
+    if not isinstance(cards, dict):
+        return set()
+    return {str(k) for k in cards}
+
+
+def _index_by_name(bulk: list[dict], groups: dict[str, list[dict]]) -> dict[str, dict]:
+    """normalized name → the GAMEPLAY printing (oracle_id has >=1 phase face
+    record; a multi-face card is keyed by every face name too; art_series /
+    reversible dups are skipped because their oracle_id is absent from phase's
+    card-data.json).
+
+    A back face is keyed so a test of that face's own phase record can name it
+    (``test_phase_records("Howlpack Alpha")`` → Mayor of Avabruck, whose two
+    records the test picks the face from) — the crosswalk suites address faces
+    that way. Without the key, a back-face name fell through to whatever other
+    record shared it: Krallenhorde Howler resolved to its art-series card."""
+    by_name: dict[str, list[tuple[int, dict]]] = defaultdict(list)
+    for c in bulk:
+        nm = c.get("name")
+        if not nm:
+            continue
+        by_name[normalize_card_name(nm)].append((0, c))
+        if " // " in nm:
+            front, *rest = nm.split(" // ")
+            by_name[normalize_card_name(front)].append((1, c))
+            for face in rest:
+                by_name[normalize_card_name(face)].append((2, c))
+    resolved: dict[str, dict] = {}
+    for key, ranked in by_name.items():
+        # A standalone card whose name IS the key wins over a split card keyed
+        # here only by its front face ("Bind" vs "Bind // Liberate") — the same
+        # policy CardPool.by_name applies — and a front face wins over a back
+        # face. Stable sort: order otherwise kept.
+        printings = [c for _rank, c in sorted(ranked, key=lambda rc: rc[0])]
+        pick = next((c for c in printings if c.get("oracle_id") in groups), None)
+        if pick is None:
+            # No printing has phase coverage — real for NON-PLAYABLE folded
+            # objects (a dungeon, the Ring emblem — ADR-0025), which phase
+            # never parses. Fall back to any oracle_id-bearing printing
+            # (art-series records carry none, so the poisoning trap can't
+            # bite); build_snapshot stores it with zero phase records and
+            # text-only trees, and reports it loudly.
+            pick = next((c for c in printings if c.get("oracle_id")), None)
+        if pick is not None:
+            resolved[key] = pick
+    return resolved
+
+
+def build_snapshot(names: set[str], out_path: Path | None = None) -> tuple[Path, dict]:
+    cdp = ensure_card_data()
+    phase_data = json.loads(cdp.read_text())
+    groups = _group_by_oracle_id(phase_data)
+
+    bulk_path = default_bulk_path()
+    if bulk_path is None:
+        raise SystemExit(
+            "No MTGJSON bulk found. Run `download-mtgjson` first (this gated "
+            "script needs the local bulk + phase's card-data.json)."
+        )
+    bulk = load_bulk_cards(bulk_path)
+    index = _index_by_name(bulk, groups)
+
+    cards: dict[str, dict] = {}
+    unresolved: list[str] = []
+    no_phase_records: list[str] = []
+    lossy: list[str] = []
+    for name in sorted(names):
+        rec = index.get(normalize_card_name(name))
+        if rec is None:
+            unresolved.append(name)
+            continue
+        oid = rec.get("oracle_id") or ""
+        phase_records = groups.get(oid) or []
+        if not phase_records:
+            # A wholly phase-uncovered object (non-playable folded object,
+            # ADR-0025): stored with ZERO phase records; the trees below are
+            # full text-only synthesis — the same trees testkit's seeding and
+            # production's empty-recs+bulk branch build. Reported in stats so
+            # a PLAYABLE card landing here (never observed) gets eyeballed.
+            no_phase_records.append(name)
+        # Build the REAL concept trees once (against the FULL bulk record, so a
+        # W2c text-only face — a bulk ``card_faces`` entry phase has no matching
+        # record for — is captured too) and seed the trees memo so BOTH the full-
+        # and minimal-record signal calls below (and every downstream test) reuse
+        # this exact tree set — the same lazy-build-once contract production's
+        # ``trees_for`` gives a live process.
+        seed_trees(oid, build_trees(oid, tuple(phase_records), bulk=rec))
+        minimal = _minimal(rec)
+        # Field-completeness guard: the slice must lose no signal vs the full
+        # record, over the SAME seeded trees (``ir=None`` — the crosswalk merge
+        # never reads it; only the legacy fallback would, and both calls agree by
+        # construction since neither exercises it here).
+        full_sigs = {(s.key, s.scope, s.subject) for s in extract_signals(rec)}
+        mini_sigs = {(s.key, s.scope, s.subject) for s in extract_signals(minimal)}
+        if full_sigs != mini_sigs:
+            lossy.append(
+                f"{name}: only-full={full_sigs - mini_sigs} "
+                f"only-mini={mini_sigs - full_sigs}"
+            )
+            continue
+        cards[name] = {"scryfall": minimal, "phase_records": list(phase_records)}
+
+    if lossy:
+        raise SystemExit(
+            "Minimal Scryfall slice dropped signals — expand _SCRY_FIELDS:\n  "
+            + "\n  ".join(lossy)
+        )
+
+    out = out_path or snapshot_path()
+    payload = {
+        "schema": SCHEMA_VERSION,
+        "crosswalk_sidecar_version": CROSSWALK_SIDECAR_VERSION,
+        "phase_tag": PHASE_TAG,
+        "cards": cards,
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=1, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    stats = {
+        "cards": len(cards),
+        "requested": len(names),
+        "unresolved": unresolved,
+        "no_phase_records": no_phase_records,
+        "bytes": out.stat().st_size,
+    }
+    return out, stats
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build the committed test card snapshot (Scryfall + raw phase "
+            "face records)."
+        )
+    )
+    parser.add_argument(
+        "--names", default="", help="Comma-separated card names (additive to the scan)."
+    )
+    parser.add_argument(
+        "--names-file", default=None, help="File with one card name per line."
+    )
+    parser.add_argument(
+        "--no-scan",
+        action="store_true",
+        help=(
+            "Skip the test-tree usage scan and the preset-registry / bridge-"
+            "ledger name reads."
+        ),
+    )
+    parser.add_argument(
+        "--out", default=None, help="Output path (default: the fixture)."
+    )
+    parser.add_argument(
+        "--prune",
+        action="store_true",
+        help=(
+            "Drop names already in the committed snapshot that the scan/"
+            "--names/--names-file don't re-supply. Default: union with the "
+            "existing snapshot's names, so a name the AST scan can't see "
+            "(e.g. fed through a dynamic comprehension over imported "
+            "registry data, not a string literal) is never silently lost "
+            "on a bare regen."
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    out_path = Path(args.out) if args.out else snapshot_path()
+    # Repo root = the parent of tests/ (snapshot lives at tests/fixtures/<file>).
+    repo_root = out_path.resolve().parents[2]
+
+    names: set[str] = set()
+    if not args.no_scan:
+        names |= set(scan_test_usage(repo_root))
+    if args.names:
+        names |= {n.strip() for n in args.names.split(",") if n.strip()}
+    if args.names_file:
+        names |= {
+            ln.strip()
+            for ln in Path(args.names_file).read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        }
+    if not names:
+        print("No card names found (scan empty and no --names). Nothing to do.")
+        return 1
+
+    existing = set() if args.prune else _existing_names(out_path)
+    carried_forward = existing - names
+    names |= existing
+
+    out, stats = build_snapshot(names, out_path)
+    kb = stats["bytes"] / 1024
+    print(
+        f"Wrote {stats['cards']}/{stats['requested']} cards to {out} "
+        f"({kb:.0f} KB, crosswalk sidecar v{CROSSWALK_SIDECAR_VERSION}, "
+        f"phase {PHASE_TAG})."
+    )
+    if carried_forward:
+        print(
+            f"  carried forward {len(carried_forward)} name(s) already in "
+            "the committed snapshot but not rediscovered by this run "
+            "(pass --prune to drop them instead)."
+        )
+    if stats["unresolved"]:
+        print(f"  unresolved (no gameplay printing): {stats['unresolved']}")
+    if stats["no_phase_records"]:
+        print(
+            "  stored TEXT-ONLY (no phase records — expected for folded "
+            f"objects): {stats['no_phase_records']}"
+        )
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

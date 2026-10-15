@@ -1,0 +1,2087 @@
+---
+name: deck-wizard
+description: Build and tune MTG decks across all formats — Commander/EDH, Brawl, Historic Brawl, Standard, Alchemy, Historic, Pioneer, Timeless, Modern, PreModern, Legacy, and Vintage, plus Sealed and Draft from an opened pool.
+compatibility: Requires Python 3.12+ and uv. Shares mtg_utils package via symlink.
+license: 0BSD
+---
+
+# Deck Wizard
+
+Build MTG decks from scratch or tune existing ones, across every supported format: Commander/EDH, Brawl, Historic Brawl (singleton formats with commanders) and Standard, Alchemy, Historic, Pioneer, Timeless, Modern, PreModern, Legacy, Vintage (60-card constructed formats with sideboards). Every recommendation MUST be grounded in actual card oracle text from Scryfall — never from training data.
+
+The skill has two phases. **Phase 1 (Deck Acquisition)** determines how the user gets a deck: either by parsing an existing list (Path A) or building from scratch (Path B). Both paths produce a deck JSON, hydrated on demand through its own sidecar. **Phase 2 (Tuning)** runs the same 13-step pipeline on that deck regardless of origin.
+
+## The Iron Rule
+
+**NEVER assume what a card does.** Before referencing any card's abilities, look up its oracle text via the helper scripts. Training data is not oracle text.
+
+**Exception (Commander/Brawl only):** During commander *discovery* (recommending commanders to a user who doesn't know what to build), you may use training data to generate a shortlist of candidates. But every recommended commander MUST be verified before presenting — write all candidate names to a JSON list and batch-lookup in one call: `scryfall-lookup --batch <candidates.json> --bulk-data <bulk-data-path> --cache-dir <working-dir>/.cache`.
+
+For 60-card constructed: discovery (brainstorming candidates) may use training data; evaluation (deciding to include) must use verified oracle text.
+
+---
+
+## Supported Formats
+
+| Format | Deck Size | Copy Limit | Sideboard | Platform | Legality Key | Notes |
+|--------|-----------|------------|-----------|----------|-------------|-------|
+| commander | 100 | 1 (singleton) | No | Paper + MTGO | commander | 40 life, multiplayer |
+| brawl | 60 | 1 (singleton) | No | Arena | standardbrawl | 25/30 life, Standard pool |
+| historic_brawl | 100 | 1 (singleton) | No | Arena (+ paper) | brawl | 25/30 life, all Arena sets |
+| competitive_brawl | 100 | 1 (singleton) | No | Arena only | competitivebrawl | 25 life, 1v1, **no free mulligan** |
+| standard | 60 | 4 | 15 | Arena + Paper | standard | Rotating |
+| alchemy | 60 | 4 | 15 | Arena only | alchemy | Digital mechanics |
+| historic | 60 | 4 | 15 | Arena only | historic | All Arena sets |
+| timeless | 60 | 4 | 15 | Arena only | timeless | No bans |
+| pioneer | 60 | 4 | 15 | Paper + Arena | pioneer | RTR forward |
+| modern | 60 | 4 | 15 | Paper + MTGO | modern | 8th Edition forward |
+| premodern | 60 | 4 | 15 | Paper + MTGO | premodern | 4th Edition through Scourge |
+| legacy | 60 | 4 | 15 | Paper + MTGO | legacy | Eternal, ban list |
+| vintage | 60 | 4 (restricted=1) | 15 | Paper + MTGO | vintage | Restricted cards limited to 1 copy |
+| sealed | 40 (minimum) | none (as opened) | the unused pool | Arena + Paper | pool containment | Built from the opened pool + basics (CR 100.2b) |
+| draft | 40 (minimum) | none (as opened) | the unused pool | Arena + Paper | pool containment | Same rules as sealed; the pool is what you drafted |
+
+---
+
+## Progress Tracking
+
+**Before starting, create a `TodoWrite` list.** The first question determines the path; create todos accordingly.
+
+### Phase 1: Path A (Tune Existing Deck)
+
+- Parse Deck List
+- Hydrate Card Data
+
+### Phase 1: Path B (Build from Scratch)
+
+#### 60-Card Constructed
+
+- Interview
+- Metagame Research
+- Skeleton Generation
+- Structural Verification
+
+**Skeleton Generation expansion:** When starting, expand into sub-todos:
+- Fill Creatures/Threats
+- Fill Removal/Interaction
+- Fill Card Advantage
+- Fill Utility/Flex Slots
+- Fill Mana Base
+- Fill Sideboard (Bo3 only)
+
+**Combo-first variant:** If the user wants to build around a combo, add/swap:
+- Combo/Build-Around Discovery (replaces standard research intro)
+- Shell Construction (replaces Metagame Research)
+- Skeleton with Combo Core (replaces standard Skeleton Generation)
+
+#### Commander/Brawl/Historic Brawl
+
+- Interview
+- Commander Analysis
+- Skeleton Generation
+- Structural Verification
+
+**Skeleton Generation expansion:** When starting, expand into sub-todos:
+1. Fill Lands
+2. Fill Ramp
+3. Fill Card Draw
+4. Fill Targeted Removal & Board Wipes
+5. Fill Protection/Utility
+6. Fill Engine/Synergy Pieces
+7. Fill Win Conditions
+8. Structural Verification (deck-stats, mana-audit, price-check)
+
+If you draft the whole skeleton in a single batch instead of walking the fill order category-by-category, you still must not batch the sub-todo completions. Either (a) skip creating the fill-order sub-todos entirely for that session (mark only the top-level Skeleton Generation as it starts and completes) or (b) close each sub-todo individually at draft time as you mentally finish that category.
+
+**If the user takes the "Outside the Box" workflow**, add or swap todos as you reach each alt step, leaving any already-completed standard steps in place.
+
+Do NOT create per-card sub-todos inside any fill step — that's execution detail and would flood the list.
+
+### Phase 2: Tuning (Both Paths)
+
+1. Step 1: Baseline Metrics
+2. Step 2: User Intake
+3. Step 3: Research
+4. Step 4: Strategy Alignment
+5. Step 5: Commander Interaction Audit *(Commander/Brawl/Historic Brawl only — skip for 60-card constructed)*
+6. Step 6: Analysis
+7. Step 7: Pre-Grill Verification
+8. Step 8: Self-Grill
+9. Step 9: Propose Changes
+10. Step 10: Impact Verification
+11. Step 11: Close Calls
+12. Step 12: Finalize
+
+Mark each item `in_progress` the moment you begin it and `completed` the moment it finishes — **do not batch updates**.
+
+**Step 6 and Step 8 are long enough that the top-level item alone leaves the user staring at an unchanging list.** When you reach them, expand each into sub-todos *at that moment* (not up front):
+
+- **Step 6** sub-todos: 6a Mana Base & Curve Audit, 6b Interaction & Threat Audit, 6c Archetype Coherence, 6d Draft Cuts, 6e Draft Additions, 6f Sideboard Evaluation (60-card only), 6g Swap Balance Check.
+- **Step 8** sub-todos: Dispatch Proposer + Challenger Subagents, Process Challenger Report, Revise Proposal.
+
+Do NOT create per-card sub-todos for the Cut Checklist inside Step 6 — that's execution detail and would flood the list.
+
+**Path B adaptations:** Steps 9-11 may produce zero changes if the skeleton is sound. If no changes are needed, skip to Step 12.
+
+---
+
+## Setup (First Run)
+
+```bash
+uv sync --directory <skill-install-dir>
+download-mtgjson
+```
+
+Subsequent runs skip if `.venv` exists and bulk data is fresh (24h).
+
+---
+
+## Tooling Notes
+
+### JSON File Writing
+
+**Use the Write tool** for any JSON file containing card names. Apostrophes in names (e.g., "Ashnod's Altar") break shell quoting in heredocs and inline Python. Write tool permissions are cacheable across the session; `python3 -c "..."` re-prompts every time.
+
+Do NOT write JSON via Bash heredocs (`cat > /tmp/foo.json << 'JSONEOF' ... JSONEOF`). Heredocs are functionally fine but they produce un-cacheable Bash permission patterns: Claude Code's permission engine bakes the heredoc body into the allow pattern, so every invocation with different content re-prompts the user. The Write tool generates a single `Write(/tmp/**)` permission that can be granted once and reused.
+
+**The same caching trap applies to `python3 -c "..."`, `awk '...'`, `jq '...'`, and any other Bash pattern where the code body varies between invocations.** Each unique body is a fresh permission pattern. If you need to extract one field from a JSON file, prefer: (a) passing the file directly to a script that already knows how to parse it, (b) `Read` with `offset`/`limit` on the JSON file, or (c) `Grep` on the file. Reach for `python3 -c` only when those options genuinely don't cover the case, and accept the re-prompt cost when you do.
+
+### Scratch File Paths
+
+Reuse these stable paths within a session: `/tmp/cuts.json`, `/tmp/adds.json`, `/tmp/sideboard-cuts.json`, `/tmp/sideboard-adds.json`, `/tmp/candidates.json`, `/tmp/pet-cards.json`.
+
+**Warning — `/tmp` files persist across sessions.** The Write tool requires a prior `Read` for any existing file, so the first `Write` to a reused `/tmp/*.json` path in a new session fails with *"File has not been read yet"*. If you batched that `Write` in parallel with a Bash call that reads the same file, **the Bash silently consumes the stale prior-session content** — the parallel Write error doesn't block the Bash, so `cut-check` / `scryfall-lookup --batch` / `price-check` / `build-deck` will happily run against the wrong data. Symptom: tool results list cards you never proposed. **Rule:** (a) at session start, `Read` each scratch path you plan to reuse before the first `Write`, OR (b) run `Write` sequentially (not parallel) and verify success before the dependent Bash call. Never batch `Write(/tmp/foo.json)` + `Bash(tool reading /tmp/foo.json)` in a single message. If a tool result lists cards that don't match your intended input, suspect stale-file consumption before suspecting a tool bug.
+
+### Alchemy Card Warning
+
+Alchemy adds **digital-only originals** beyond the Standard pool, with mechanics that only work on Arena (conjure, seek, perpetually, etc.). Verify their oracle text like any other card. Arena reverted every **rebalanced** (`A-`) card to its paper version on 2026-09-22 and the card data no longer carries rebalanced `A-` records, so look up the plain card name. If Arena ever rebalances a card again, the `A-` name is the one with the live oracle text.
+
+### AskUserQuestion Cap
+
+**AskUserQuestion caps at 4 options — never silently drop the rest.** The tool's schema rejects more than 4 options per question. When presenting a longer list (5+ close-call swaps, 5 alternative commanders, etc.), do NOT pick 4 and hide the rest. List **every** option in the preceding text message with enough detail to decide on, then use AskUserQuestion only as a lightweight picker — either (a) put the top 3 on buttons plus a 4th "Other (specify in notes)" so the user can name any option from the text list, or (b) skip AskUserQuestion entirely for that decision and let the user reply in plain text. The failure mode to avoid is 4 option chips that look like the complete set when the text above mentioned 5+.
+
+### Path Requirements
+
+- **Absolute paths only.** `uv` rebases the working directory to the skill install; relative paths resolve against the wrong root.
+- **Cache directory:** Always `<working-dir>/.cache`, not the skill install directory. Keeping the cache in the working directory avoids outside-workspace permission prompts. (This is for `scryfall-lookup --batch` on name lists — candidates, pet cards, combo pieces.)
+- **Hydration:** Every deck CLI hydrates itself from a sidecar beside the deck (`deck.json` → `deck.hydrated.json`), keyed to the deck's content + bulk identity + version — a stale sidecar can't be read. Edit the deck and re-run any tool; there's nothing to re-hydrate or re-point by hand.
+
+**Always pass `--format <format>` to `parse-deck` once the format is established.** Without this, `parse-deck` defaults to `commander` and every downstream tool sees the wrong format.
+
+### Competitive Brawl (Arena)
+
+`competitive_brawl` is a first-class format — pass `--format competitive_brawl` and the
+tools handle it. Do NOT audit it as `historic_brawl` and hand-wave the failures.
+
+It is Arena's ranked Brawl queue (June 2026): 100-card singleton, 1v1, 25 life,
+**no free mulligan** (unlike ordinary Brawl), no commander damage, planeswalkers
+legal as commanders without explicit permission text.
+
+Two things to know about its card pool:
+
+1. **Its ban list is not ordinary Brawl's.** It bans ten cards, as commander and in the
+   99, and legalizes every other Arena card, including most of the cards ordinary Brawl
+   bans (Mana Drain, Demonic Tutor, Fierce Guardianship, Ancient Tomb, Chrome Mox…).
+   The tools read MTGJSON's own `competitivebrawl` legality key, so a `banned` under
+   `brawl` means nothing here; `not_legal` means the card isn't on Arena at all. A card
+   bulk downloaded before 2026-10-10 lacks that key, so every card reads `not_legal`;
+   the loader warns when it builds the index from such a bulk. Run `download-mtgjson`.
+2. **Rebalanced cards were reverted on 2026-09-22.** Arena turned every Alchemy `A-`
+   rebalance back into the paper printing, in every format, and the card data has caught
+   up: the `A-` records are gone and the paper cards carry the real legality (paper Nadu
+   is banned under `competitivebrawl`; Harald, King of Skemfar is legal). Treat any
+   leftover `A-` result as stale data.
+
+**Determining Arena availability generally:** a card is craftable iff its MTGJSON record
+has `arena` in `games`. Checking the legality key alone is not sufficient — `banned` and
+`not_legal` both mean "not legal in ordinary Brawl" but only the latter means "not on
+Arena."
+
+The ban list is a point-in-time snapshot (source: https://mtg.wiki/page/Competitive_Brawl).
+Re-verify it after each B&R announcement.
+
+### Arena Rarity Warning
+
+The `rarity` field in the deck's hydrated sidecar is the **default Scryfall printing's rarity**, which drifts from Arena's actual wildcard cost. Always use `price-check --format <fmt> --medium digital --bulk-data <path>` for Arena wildcard budgeting. The medium, not the format, picks wildcards vs USD: Arena-only formats (Brawl, Historic Brawl, Alchemy, Historic, Timeless) are digital anyway, but Standard and Pioneer default to paper, so an Arena build of those needs `--medium digital` (or `"medium": "digital"` in the deck JSON). When Arena is installed it reads the rarity straight from Arena's own card database (ADR-0057), the lowest rarity among the card's craftable printings, so it matches what Arena charges. Without Arena it falls back to MTGJSON's printings, which are wrong for about 35 cards, mostly Special Guests reprints that MTGJSON lists as mythic.
+
+### Licensed IP Card Warning
+
+Some crossover sets use different card names on Arena than in paper/Scryfall: Through the Omenpaths (OM1, the Arena version of Marvel's Spider-Man), Ikoria Godzilla variants, Crimson Vow Dracula variants, and Avatar: The Last Airbender cards all have name discrepancies. **Always pass `--bulk-data` to `mark-owned`** when working with Arena collections — this enables `printed_name` and `flavor_name` aliasing so cards like "Skittering Kitten" (Arena name) correctly match "Masked Meower" (Scryfall name). Without `--bulk-data`, these cards silently appear unowned.
+
+### Parsed Deck JSON Schema
+
+**60-card constructed:**
+
+```json
+{
+  "format": "pioneer",
+  "deck_size": 60,
+  "sideboard_size": 15,
+  "commanders": [],
+  "cards": [{"name": "Lightning Bolt", "quantity": 4}, ...],
+  "sideboard": [{"name": "Roiling Vortex", "quantity": 3}, ...],
+  "total_cards": 60,
+  "total_sideboard": 15,
+  "owned_cards": [{"name": "Lightning Bolt", "quantity": 4}, ...]
+}
+```
+
+Constructed formats always have `"commanders": []`. The `sideboard` field holds sideboard entries separately from mainboard `cards`.
+
+**Commander/Brawl/Historic Brawl:**
+
+```json
+{
+  "format": "commander",
+  "deck_size": 100,
+  "commanders": [{"name": "...", "quantity": 1}, ...],
+  "cards":      [{"name": "...", "quantity": 1}, ...],
+  "total_cards": 100,
+  "owned_cards": [{"name": "...", "quantity": 1}, ...]
+}
+```
+
+All card lists (`commanders`, `cards`, `sideboard`, `owned_cards`) share the `[{name, quantity}]` shape. `owned_cards` starts empty from `parse-deck` and is populated by `mark-owned`. `price-check` reads it to subtract owned copies from the budget; entries with `quantity < 1` are treated as "not owned."
+
+**Parsed deck JSON is the only input every deck tool takes.** Once you have a parsed deck JSON from `parse-deck`, pass it **directly** to every deck CLI — `deck-hydrate`, `price-check`, `deck-stats`, `mana-audit`, `legality-audit`, `combo-search`, `card-summary`, `deck-signals`, `slot-budgets`, `deck-tune`, and the rest all take `<deck.json>` (plus the shared optional `--bulk-data <path>`) and hydrate themselves through their own sidecar — never a separately-tracked hydrated path. Do NOT extract card names into a separate `/tmp/*.json` via `python3 -c` or similar. (The exception is scripts whose input is a *subset* of the deck — `cut-check --cuts <path>` and `build-deck --cuts <path> --adds <path>` expect JSON lists of name strings, not parsed deck JSON, because the caller is specifying which cards to act on. Writing a small `/tmp/cuts.json` via the Write tool is correct in those cases.)
+
+### Script Invocation
+
+All scripts are invoked via `uv run <script-name>` from the skill install directory. Examples in this document elide the `uv run` prefix for brevity.
+
+### Card Count Verification
+
+After writing or editing a deck text file by hand, always parse it immediately and verify the total card count matches the format's expected size. Off-by-one errors from manual edits are common and silent. **Preventive:** before writing the deck file, tally your categories visibly in the narrative:
+> - **100-card** (Commander / Historic Brawl): e.g., "Lands 36 + Ramp 10 + Draw 10 + Removal 10 + Wipes 3 + Utility 8 + Engine 18 + Wincons 4 = 99 + 1 commander = 100"
+> - **60-card singleton** (Brawl): scale each category by 0.6 and round. E.g., "Lands 22 + Ramp 6 + Draw 6 + Removal 6 + Wipes 2 + Utility 5 + Engine 11 + Wincons 1 = 59 + 1 commander = 60"
+> - **60-card constructed**: "Creatures 24 + Instants/Sorceries 16 + Lands 20 = 60"
+
+### Populating `owned_cards`
+
+When building from a user's collection, use the dedicated helper rather than inline `python3 -c`:
+
+```
+mark-owned <deck.json> <collection.json> [--bulk-data <bulk-data-path>]
+```
+
+**Always pass `--bulk-data` for Arena collections** — this enables `printed_name` and `flavor_name` aliasing so crossover cards match correctly. The script is idempotent and safe to chain after every `parse-deck` / `set-commander` call.
+
+`mark-owned` also does front-face aliasing for DFC / split / adventure / modal cards: a deck that lists `"Fable of the Mirror-Breaker"` (front face only, common in Arena/Moxfield exports) matches a collection entry for `"Fable of the Mirror-Breaker // Reflection of Kiki-Jiki"` (Scryfall's canonical combined form) and vice versa. You do not need to normalize these by hand before calling `mark-owned`.
+
+**Ownership rule — follow it whenever you count copies or wildcards.** Basic lands (Plains, Island, Swamp, Mountain, Forest, Wastes) count as owned in any quantity. On Arena that has no exception (basic styles are cosmetic). In paper the exception is a deck that asks for a special printing — foil or etched, full-art, borderless, a showcase or other special frame, a promo — which is owned only if the collection holds that exact printing (a collection that lists basics by name only, or not at all, doesn't); a plain set pin like "Forest (M21) 274" stays owned. Snow-Covered basics are different cards, collected like any other. On Arena, owning four copies of a card covers any quantity: four Hare Apparent or Rat Colony ("any number") fill every slot, four Seven Dwarves ("up to seven") fill seven — but three owned is three copies. Otherwise, in either medium, you have what you own. The tools already apply this through one function (`Format.copies_short`): `price-check` (USD shortfall in paper, wildcards on Arena), `deck-tune`'s purse (each added copy is free only if the collection covers that copy), and deck-forge's cost readouts. When you reason by hand — "can they build this?", "how many wildcards?" — apply the same rule, not a raw owned-vs-needed comparison.
+
+### Decision Table
+
+| Task | Tool |
+|------|------|
+| Find format-legal cards by oracle text, type, CMC | `card-search --format <fmt> --bulk-data <path>` |
+| Warm/verify the deck's hydrated sidecar (check `missing`) | `deck-hydrate <deck.json> [--bulk-data <path>]` |
+| **Run the Step-6 deterministic spine (scorecard + candidate swaps)** — every format | `deck-tune <deck.json> [--bulk-data <path>] [--bracket <1-5>] [--max-swaps <N>] [--budget <usd> \| --wildcards <rarity=N,…>] [--medium paper\|digital] [--exclude <name>]… --output <wd>/tune.json` |
+| See what the commander/deck cares about (signal lanes) — *ad-hoc; the spine's `focus` has this* | `deck-signals <deck.json> [--bulk-data <path>] [--json]` |
+| Role-density budgets (lands/ramp/draw/interaction/wipes) — *ad-hoc; the spine's `template` has this* | `slot-budgets <deck.json> [--bulk-data <path>] [--shape <S>] [--json]` (deck size comes from the deck JSON) |
+| Rank a separate candidate list by synergy — *the spine's `swaps` already rank adds* | `deck-rank <deck.json> <candidates.json> [--bulk-data <path>] [--limit <N>] [--json] [--medium paper\|digital] [--meta auto\|off\|<archetype>]` (candidates from `card-search --json`) |
+| Look up a specific card's oracle text | `scryfall-lookup "<Card Name>"` |
+| View card table (mainboard) | `card-summary <deck.json> [--nonlands-only] [--lands-only] [--type <T>] [--bulk-data <path>]` |
+| View card table (sideboard) | `card-summary <deck.json> --sideboard [--bulk-data <path>]` |
+| Scan the deck for cards matching an oracle pattern | `Grep '<regex>' <wd>/deck.hydrated.json` — full oracle text, no truncation |
+| Count cards / verify total matches deck size | `deck-stats <deck.json> [--bulk-data <path>]` |
+| Find combos in the deck | `combo-search <deck.json> [--bulk-data <path>] [--max-near-misses <N>]` |
+| Find combos by card or outcome | `combo-discover --card "<Name>" --format <fmt>` |
+| Check whether a proposed cut breaks a near-miss | `Grep '<cut-name>' <combo-search.json>` to find near-miss lines where this card appears as a partner |
+| Check deck legality | `legality-audit <deck.json> [--bulk-data <path>] [--cite-rules/--no-cite-rules] [--rules-file <path>]` |
+| Check mana base health | `mana-audit <deck.json> [--bulk-data <path>]` |
+| Compare mana before/after | `mana-audit <deck.json> --compare <new-deck.json> [--bulk-data <path>]` |
+| Price check (paper) | `price-check <deck.json> --bulk-data <path>` |
+| Price check (Arena wildcards) | `price-check <deck.json> --format <fmt> --medium digital --bulk-data <path>` |
+| **Check a proposal against every mechanical gate (Steps 7 + 10)** | `proposal-check <deck.json> --cuts <c.json> --adds <a.json> [--sideboard-cuts …] [--sideboard-adds …] [--budget <usd> \| --wildcards <rarity=N,…>] [--medium paper\|digital] [--collection <collection>] [--allow-combo-loss] [--multiplier-low N --multiplier-high N] [--output-dir <dir>]` (writes `new-deck.json` + sidecar and `proposal-check.json`; exits 1 on a FAIL) |
+| Apply mainboard + sideboard changes | `build-deck <deck.json> --cuts <c.json> --adds <a.json> --sideboard-cuts <sc.json> --sideboard-adds <sa.json> [--bulk-data <path>] [--output-dir <dir>]` (writes `new-deck.json` + its own `new-deck.hydrated.json` sidecar) |
+| Compare deck versions | `deck-diff <old-deck.json> <new-deck.json> [--bulk-data <path>]` |
+| Export for import | `export-deck <deck.json>` (auto-picks Arena section headers for Arena formats; `--style moxfield\|arena` to force) |
+| Mark owned cards from collection | `mark-owned <deck.json> <collection.csv> [--bulk-data <path>]` |
+| Know which deck cards I own and how many | `mark-owned <deck.json> <collection.json> [--output PATH] [--bulk-data <path>]` |
+| Plan wildcard spend / get per-card or aggregate Arena rarity | `price-check <deck.json> --format <fmt> --medium digital --bulk-data <path>` |
+| Get a card's Arena-lowest rarity | `price-check --format <fmt> --medium digital` (never the deck's hydrated sidecar `rarity` field) |
+| Find owned, legal, commander-eligible cards from a collection | `find-commanders <collection.json> --format <fmt> --bulk-data <path> --output <working-dir>/.cache/candidates.json` |
+| Research metagame/strategy | WebSearch + WebFetch (or `web-fetch` script) |
+| Run the self-grill (Step 8 hard gate) | Two parallel `Agent` calls with `subagent_type: "general-purpose"` |
+| Cite MTG Comprehensive Rules for a ruling | `rules-lookup --rule <n>` / `--term <keyword>` / `--grep "<regex>"` |
+| Fetch Scryfall per-card rulings | `rulings-lookup --card "<name>" --bulk-data <path>` |
+| Deeper rules question (layer/timing/stack) | Invoke the `rules-lawyer` skill via the Skill tool |
+
+Only write `python3 -c` when none of these cover the need. When you do, batch every related question into a single body — each unique body is a fresh permission pattern, so one big script beats five small ones.
+
+### Rules Lawyer
+
+For trivial rules questions that arise during tuning ("what does trample say?", "is this trigger mandatory?"), run `rules-lookup --term <keyword>` directly — a single CLI call returns the glossary definition plus the relevant CR rule numbers. For nuanced multi-rule questions (layer interactions, replacement-effect timing, stack ordering across triggered and activated abilities), invoke the `rules-lawyer` skill, which owns the escalation-to-subagent path.
+
+`cut-check` and `legality-audit` auto-attach CR citations to their JSON output — `--cite-rules` is **default-on**. When a CR file is present in the working directory (i.e., you ran `download-rules --output-dir <wd>` in the same working dir), each flagged interaction / violation carries a rule number + snippet with no extra flag. Pass `--no-cite-rules` to opt out on a specific invocation; when no CR is reachable the tools still exit 0 and emit a `WARN: rule_citations not attached` line to stdout.
+
+Run `download-rules --output-dir <working-dir>` once per session before any Step 1 legality-audit call (24-hour freshness check, same pattern as `download-mtgjson`).
+
+---
+
+## Phase 1: Deck Acquisition
+
+Start by asking: **"Do you have an existing deck to tune, or do you want to build from scratch?"**
+
+If the user provides a deck list (pasted, file path, or URL), follow **Path A**. If they want to build from scratch, follow **Path B**. If they opened a sealed pool or drafted (a limited event), follow **Path C**.
+
+---
+
+## Phase 1, Path A: Parse + Hydrate Existing Deck
+
+### Parse Deck List
+
+```
+parse-deck <path> --format <format> --output <working-dir>/deck.json
+```
+
+- Auto-detects input format (Moxfield, MTGO, Arena, plain text, CSV)
+- Routes sideboard cards to the `sideboard` field (separate from `cards`)
+- Strips Moxfield set code suffixes and merges duplicate card names automatically
+- Reports: `parse-deck: N cards, M sideboard -> /path/to/deck.json`
+
+**Always pass `--format <format>` explicitly.** Without it, `parse-deck` defaults to `commander` and every downstream tool (legality-audit, price-check) sees the wrong format.
+
+Supported formats: `commander` (100 cards), `brawl` (60 cards, Standard card pool), `historic_brawl` (100 cards, Historic/Arena card pool), `standard`, `alchemy`, `historic`, `pioneer`, `timeless`, `modern`, `legacy`, `vintage` (all 60 cards with 15-card sideboard), `sealed` / `draft` (40-card minimum from an opened pool — Path C). Use `--deck-size` to override the default deck size.
+
+If the format is not obvious from context, ask the user.
+
+#### Commander Formats
+
+If `commanders` is empty (common with Moxfield exports that lack `//Commander` headers), ask the user who the commander is. Don't guess — the first card in the list is often the commander, but not always. Supports partner commanders, friends forever, and background pairings.
+
+Run `set-commander <deck.json> 'Commander Name'` to move the card from the cards list to the commanders list. **`set-commander` is idempotent** — calling it on a card already in the `commanders` zone is a silent no-op, so it's safe to chain after `parse-deck` even when the deck file already had a Moxfield `Commander` header.
+
+#### Collection Ownership (Arena)
+
+If the user has an Arena collection:
+1. Ask for Untapped.gg CSV export first (most reliable source)
+2. `mark-owned <deck.json> <collection.csv> --bulk-data <path>` to populate `owned_cards` (accepts both CSV and parsed-deck JSON)
+3. Use `mtga-import` only for extracting wildcard counts, not collection data
+4. Count what the collection covers by the ownership rule (Tooling Notes): four owned copies cover any quantity, basic lands are owned unless a paper deck asks for a special printing
+
+Always pass `--bulk-data` for Arena collections (see Tooling Notes > Populating `owned_cards` for details on aliasing).
+
+### Hydrate Card Data
+
+```
+deck-hydrate <working-dir>/deck.json [--bulk-data <path>]
+```
+
+Returns an envelope with `sidecar_path`, `card_count`, `missing`, `digest`. This builds `deck.hydrated.json` beside the deck JSON — every mainboard + sideboard + commander + companion card joined against the card data, keyed inside the file by the deck's content, the bulk's identity, and the payload version. **Check `missing`** — names the card data couldn't resolve are warned once on stderr and excluded from counts.
+
+**Do NOT Read the sidecar directly** — it's large and floods context. Use `card-summary` or `scryfall-lookup "<Name>"` for targeted reads; `Grep '<regex>' <working-dir>/deck.hydrated.json` is fine for oracle-text pattern scans.
+
+**There is no cache path to track.** Every deck CLI takes only `<deck.json>` (plus optional `--bulk-data`) and hydrates itself through this same sidecar. Edit the deck and re-run any tool — it just works. `deck-hydrate` itself is just the explicit warm/verification step right after acquisition, so you see `missing` before running analyses.
+
+After hydration, proceed to **Phase 2: Tuning**.
+
+---
+
+## Phase 1, Path C: Sealed / Draft (a limited pool)
+
+A limited deck is built from the cards the user opened plus basic lands (CR 100.2b): no copy limit, no sideboard cap (the sideboard is the unused pool), a 40-card minimum, and legality is **pool containment**. The whole toolchain models it as the `limited` family (ADR-0055) — never borrow a constructed format at 40 cards.
+
+```
+parse-deck <arena-export.txt> --format sealed --output <working-dir>/deck.json
+# a bare list of the opened cards (no deck yet): add --pool-only
+deck-hydrate <working-dir>/deck.json
+```
+
+The export's Deck section becomes `cards`, Deck + Sideboard become the `pool` zone, and the Sideboard section stays the sideboard. Then, **before forming any opinion about a colour pair**:
+
+1. `pool-colors <working-dir>/deck.json` — every mono colour and colour pair the pool supports on equal footing (playables, creatures, removal, evasion, power-4-plus bodies, rares). Read the whole table; the best pair is a finding, not a premise.
+2. `set-scan --set <CODE>` — what the SET holds (removal by rarity, sweepers, evasion, the biggest bodies). Judge every answer and threat against the set opponents draw from, never against the cards the user opened.
+3. Build the best 40 for the top two or three pairs and compare them on equal footing; 17 lands is the norm (`mana-audit` reads the 16–18 limited band).
+4. `legality-audit <working-dir>/deck.json` — the containment check (every copy in the pool) plus the 40-card minimum. `deck-tune` runs the limited template (creatures, removal, curve buckets) and searches only the pool.
+
+Step 8's Self-Grill for a limited build asks the Proposer and Challenger to **rank every viable colour pair from the pool-colors table and justify the ordering** — no candidate pair is named in the prompt, and the table is the input, not a finished list.
+
+## Phase 1, Path B: Build from Scratch
+
+### Interview
+
+Start by determining the format. Ask: "What format do you want to build for?"
+
+If the user says Commander, Brawl, or Historic Brawl, follow the **Commander/Brawl Interview** below. If they name a 60-card constructed format (Standard, Pioneer, Modern, etc.), follow the **60-Card Constructed Interview**.
+
+If the user mentions Arena without specifying a format, clarify:
+- Standard, Alchemy, Historic, Timeless are Arena formats (60-card constructed)
+- Standard Brawl (called "Standard Brawl" on Arena) is Brawl
+- "Brawl" on Arena actually refers to Historic Brawl
+- Pioneer is also on Arena but shares a card pool with paper
+- Modern, PreModern, Legacy, Vintage are paper/MTGO only
+
+#### 60-Card Constructed Interview
+
+Each answer informs the next question's options, so ask sequentially via AskUserQuestion:
+
+1. **Format** — Which format? (Standard, Pioneer, Modern, etc.)
+2. **Platform** — Arena or paper? (determines pricing mode and card pool filtering; skip if format implies it, e.g., Alchemy is always Arena)
+3. **Best-of-One or Best-of-Three?** — Arena only; skip for paper. Bo1 has no sideboarding — skip sideboard construction entirely and build a mainboard optimized for Game 1 resilience (more versatile cards, fewer narrow answers). Bo3 proceeds normally with full sideboard.
+4. **Playstyle** — Aggro, midrange, control, combo, tempo? (brief explanations if user is unsure)
+5. **Color preference** — Any color preference, or open to anything?
+6. **Budget** — USD budget for paper, or wildcard budget for Arena?
+7. **Archetype preference** — "Do you want to follow a proven metagame archetype, or build something original/off-meta?"
+8. **Pet cards** — Any cards you definitely want to include? (open-ended text, not AskUserQuestion)
+
+Note: questions 2-3 can sometimes be merged or skipped (paper is always Bo3; Legacy/Vintage/Modern are always paper).
+
+##### Combo-First Path
+
+If the user says "build around a combo" or names a specific combo/build-around card, switch to the combo-first variant:
+
+**Combo/Build-Around Discovery:**
+- If user names a card: `scryfall-lookup` it, then `combo-discover --card "<Name>" --format <fmt>`
+- If user names an outcome: `combo-discover --result "<outcome>" --format <fmt>`
+- If user wants to explore: Ask about mechanics, outcomes, or colors, then search
+- **Supplement with WebSearch:** `combo-discover` uses Commander Spellbook, which is crowdsourced primarily by Commander players. Combos that are powerful in 1v1 60-card formats but weak in multiplayer Commander may be underrepresented. Search for `"<format> combo decks"` and `"<card name> combo <format>"` to catch format-specific interactions the API might miss.
+- Present 3-5 combos with: cards, oracle text, result, color identity, popularity
+- Batch-lookup all combo pieces via `scryfall-lookup --batch`
+- Let user pick a combo or build-around card
+
+#### Commander/Brawl/Historic Brawl Interview
+
+##### Commander Selection
+
+Ask: "Do you know what commander you want to build a deck for?"
+
+**If yes:**
+- Take the commander name.
+- Look up via `scryfall-lookup` to validate it exists.
+- Verify it's a legal commander using Scryfall's `is:commander` filter (the source of truth for commander legality — don't try to reimplement the rules).
+- For Brawl and Historic Brawl, also check that the card is legal in the deck's format using the Scryfall `legalities` field (key `standardbrawl` for Brawl, `brawl` for Historic Brawl).
+- Check the commander's oracle text for partner, friends forever, or choose a background. If present, ask: "This commander supports a pairing — do you have a partner/background in mind, or would you like a recommendation?" Look up and validate the second commander the same way.
+- For partner/background pairs, the deck's color identity is the combined identity of both commanders. Use the combined identity for all subsequent steps.
+- Ask: "Want a standard build or go outside the box with unusual combos?"
+  - **Standard:** Proceed to shared questions.
+  - **Outside the box:** Proceed to shared questions, then follow the "Outside the Box" workflow after commander analysis.
+
+**If no:** Ask: "Want to explore standard archetypes or go outside the box with unusual combos?"
+
+- **Standard archetypes:** Continue with the guided interview below, then standard workflow.
+- **Outside the box:** Skip to the "Outside the Box" workflow after format selection and shared questions.
+
+##### Commander Selection from a Collection
+
+**If the user provides a collection export (Untapped.gg CSV, Moxfield CSV, or any deck-list export) of cards they own** and wants to pick a commander from what they already have, follow this exact procedure. Do NOT write ad-hoc Python that loads the file and calls `.get()` on it. **Note:** collection exports often contain entries with quantity 0 (tracked/wishlisted cards the user doesn't own). `parse-deck` preserves these quantities and `mark-owned` / `find-commanders` filter by `--min-quantity 1` by default, so quantity-zero entries are excluded automatically.
+
+This narrows the candidate *pool*; it does NOT replace the guided interview. Run the interview anyway — the answers drive ranking against the narrowed pool.
+
+**Workflow:**
+
+0. **Arena players — ask for a collection CSV first.** If the user mentions Arena, Brawl, Historic Brawl, or wildcards, ask: "Do you have a collection export from Untapped.gg, Moxfield, or a similar tracker? A CSV with card names and quantities is the most reliable way to know what you own." If they have one, proceed to step 1. If they don't have a collection CSV, fall back to `mtga-import` as a last resort — but **warn the user**: mtga-import reconstructs a collection from saved Arena decks, which is unreliable because Arena allows building decks with unowned cards. **Always run `mtga-import` for wildcard extraction regardless** — it reads `InventoryInfo` from `Player.log` which is reliable for wildcard counts: `mtga-import --bulk-data <bulk-data-path> --output-dir <working-dir>`. This writes `wildcards.json` (and its own `collection.json`; if the working dir already holds a `parse-deck` collection at that name, mtga-import refuses to overwrite it — parse the CSV to a different filename such as `collection-csv.json`, or pass `--force` only if you really want the deck-derived reconstruction). Linux users need to pass `--log-path` explicitly.
+
+1. **Parse the collection** — `parse-deck <absolute-path-to-collection.csv>` produces a parsed deck JSON. `parse-deck` handles Untapped.gg CSV, Moxfield CSV, Moxfield deck export, Arena, MTGO, and plain text.
+
+2. **Find commander candidates** — `find-commanders <parsed.json> --bulk-data <bulk-data-path> --format <format> --output <working-dir>/.cache/candidates.json [--color-identity <ci>] [--min-quantity 1]`. **Always pass `--output`** — the default path is under `$TMPDIR` which triggers outside-workspace permission prompts. Stdout is a compact text table with columns EDHREC rank, color identity, CMC, name, type_line, flags (PARTNER / BACKGROUND / GC), then an `Owned pairings` list of candidate pairs that can be commanders together. The last line is `Full JSON: <path>`.
+
+3. **Run the guided interview** (colors, playstyle, mechanics, favorite cards, play group, bracket, budget) the same as the no-collection flow. The candidate pool is the constraint; the interview answers are what differentiates one commander from another.
+
+4. **Build a mixed shortlist of ~5 candidates**, weighted by interview answers. Do NOT just pick the 5 lowest `edhrec_rank` values — that produces boring recommendations. Aim for roughly:
+   - **2 staples** — well-supported commanders (low `edhrec_rank`) that obviously fit the user's stated preferences. These exist to give the user a safe pick.
+   - **2 off-meta picks** — commanders with higher or null `edhrec_rank` whose oracle text mechanically matches the interview answers (especially the mechanics question). These are usually the most interesting options.
+   - **1 wildcard** — something the user probably hasn't considered: an unusual color combo they own, a partner pairing where they own both halves, or a commander that enables a combo using cards already in their collection.
+   - For bracket gating, use the `game_changer` flag and your judgment about combo density. Do NOT use any "EDHREC bracket" field — community bracket data is user-reported and unreliable.
+
+5. **Take partner pairings from the CLI's answer, not by eye.** Each candidate's `pairs_with` lists the owned candidates it can legally share the command zone with (`card_classify.can_partner`: partner with partner, the same partner—[text] group, the named partner-with card, choose a Background with a Background, Doctor's companion with a Time Lord Doctor; CR 702.124f — different partner abilities can't be combined, so a Survivors card never pairs with a plain Partner). `partner_kinds` lists each card's pairing kinds: its partner abilities (CR 702.124a) plus the type-line kinds they pair with (a Background, a Time Lord Doctor), which aren't partner abilities themselves. Surface promising pairings as wildcard or off-meta picks.
+
+6. **Present the shortlist** following the "Commander Recommendation" rules below. Mention that candidates are filtered to cards they own.
+
+##### Format Selection (Commander/Brawl)
+
+Ask: "What format are you building for?"
+
+- **Commander/EDH** (default) — 100 cards, 40 life
+- **Brawl** — 60 cards, Standard card pool, 25/30 life, no commander damage
+- **Historic Brawl** — 100 cards (or 60 in paper), Arena/paper card pool, 25/30 life, no commander damage
+
+**Arena naming confusion:** On MTG Arena, "Brawl" (the queue name) actually refers to Historic Brawl, and "Standard Brawl" refers to what we call Brawl. If a user says "I play Brawl on Arena," they almost certainly mean Historic Brawl. Clarify which they mean.
+
+If Brawl or Historic Brawl: ask "Are you playing on Arena or in paper?"
+- **Arena** locks deck size automatically: Standard Brawl is always 60 cards, Historic Brawl (called "Brawl" on Arena) is always 100 cards. **Arena Brawl queues are always 1v1.** This fundamentally changes deck building: prioritize speed and tempo over politics, run more cheap targeted counterspells (only 1 opponent to interact with), fewer board wipes, and a faster curve.
+- **Paper Historic Brawl** only: ask if they want 100 or 60 cards. Paper Brawl can be multiplayer — use the standard interaction scaling table.
+
+If Brawl: any legendary planeswalker can be your commander (not just those with "can be your commander" text). Vehicles and Spacecraft with power/toughness are also eligible in all formats.
+
+**Colorless commanders in Brawl:** If the chosen commander has no colors in its color identity, note that the deck may include any number of basic lands of one chosen basic land type.
+
+**Partner mechanics** are available in all formats.
+
+##### Guided Interview (Commander/Brawl, one question at a time)
+
+1. **Colors** — "What colors do you enjoy playing? (Pick any combination, or 'no preference')"
+
+2. **Playstyle** — "What's your preferred playstyle?" Present options with brief plain-language explanations so newer players can follow:
+   - Aggro (attack fast and hard)
+   - Combo (assemble card combinations that win the game)
+   - Control (answer threats and win late)
+   - Voltron (power up your commander for lethal damage)
+   - Tokens (build a wide board of creature tokens)
+   - Tribal (build around a creature type)
+   - Midrange/Value (generate steady incremental advantage)
+   - Group Hug/Politics (make allies, share resources, influence the table)
+
+3. **Mechanics** — "Any specific mechanics you enjoy?" Offer examples with explanations: "+1/+1 counters (growing your creatures over time), theft (stealing opponents' cards), blink (flickering creatures to reuse their effects), spellslinger (casting lots of instants and sorceries), artifacts-matter, landfall (rewards for playing lands)." Open-ended. If the answer maps to multiple distinct sub-archetypes, ask one follow-up to disambiguate.
+
+4. **Favorite cards/sets** — "Any favorite cards or recent sets that excited you? This helps me find commanders in a similar design space."
+
+5. **Play group dynamics** — "How does your play group typically play? (casual/competitive, combo-heavy, creature-heavy, lots of interaction)"
+
+6. **Bracket** — "What power bracket are you targeting? (1-4, or casual/mid/high/max)"
+
+7. **Budget** — "What's your total budget for the deck? (dollar amount, or wildcard counts for Arena)"
+
+##### Commander Recommendation
+
+After the guided interview, recommend 3-5 commanders that fit. Partner pairs and commander + background pairings are valid recommendations — present each pair as a single option with their combined color identity. You may use training data to generate a shortlist — this is commander *discovery*, not card evaluation, so the Iron Rule does not apply at this stage. However, every recommended commander MUST be verified via `scryfall-lookup` before presenting.
+
+Present each recommendation with:
+- Card name and color identity
+- Brief explanation of why it matches the user's preferences
+- EDHREC deck count (if available) to indicate community support
+- Any notable budget implications
+
+Let the user pick.
+
+##### Shared Questions (Commander/Brawl)
+
+Ask all of these (skipping any already answered during the guided interview):
+
+- **Bracket:** "What power bracket are you targeting? (1-4, or casual/mid/high/max)"
+- **Budget:** "What's your total budget for the deck? (dollar amount, or wildcard counts for Arena)"
+- **Experience level:** "What's your Commander experience level? (beginner/intermediate/advanced)"
+- **Pet cards:** "Any cards you definitely want included?" (pet cards, combos they want to build around)
+
+For pet cards: write all pet card names to a JSON list and batch-lookup in one call: `scryfall-lookup --batch <pet-cards.json> --bulk-data <bulk-data-path> --cache-dir <working-dir>/.cache`. Verify each exists and is within the commander's color identity. Slot pet cards into the appropriate template categories — they count against those category budgets. If pet cards exceed ~10, warn the user that it limits the ability to build a balanced skeleton.
+
+#### Companion Check (60-Card Only)
+
+After the interview, check whether the deck's constraints naturally fit a Companion. Companions are powerful (a guaranteed extra card) and should be actively considered:
+
+1. `card-search --format <fmt> --bulk-data <path> --oracle "Companion" --type "Creature"` to find format-legal Companions
+2. For each Companion, check if the user's playstyle/colors/curve naturally meet the deck-building restriction (e.g., Lurrus requires no permanents with mana value > 2 — natural for low-curve aggro)
+3. If a Companion fits, suggest it: "Your deck naturally meets Lurrus's restriction — would you like to use it as a Companion? It gives you a guaranteed extra card."
+4. If the user accepts, note the Companion's restriction as a hard constraint for skeleton generation
+5. The Companion occupies 1 of 15 sideboard slots
+6. Yorion requires an 80-card deck — use `parse-deck --deck-size 80` if selected
+
+#### Experience Level Detection
+
+Infer from answers. If unclear, ask directly: beginner, intermediate, or advanced?
+
+| Level | Interview Depth | Explanation Style |
+|-------|----------------|-------------------|
+| Beginner | Explain format basics, define archetypes | Full sentences, analogies |
+| Intermediate | Assume format knowledge | Concise, note key interactions |
+| Advanced | Assume deep knowledge | Tables, shorthand, focus on novel angles |
+
+#### Pet Card Validation
+
+If the user provides pet cards:
+1. `scryfall-lookup --batch` to verify existence and oracle text
+2. Check format legality (`legalities.<format>` field)
+3. For Commander/Brawl: verify within commander's color identity
+4. Note their role (threat, removal, engine, etc.) for skeleton slotting
+
+---
+
+### Research (Path B)
+
+#### 60-Card: Metagame Research
+
+##### Proven Archetype Path
+
+1. **WebSearch** for `"<format> metagame 2026"` or `"<format> tier list"` to find current top archetypes
+2. **WebFetch** (or `web-fetch` for bot-blocked sites) the top result to get archetype names and metagame share percentages
+3. Present the top 5-8 archetypes with approximate metagame share
+4. If user has color/playstyle preference, highlight matching archetypes
+5. Let user pick an archetype
+6. **WebSearch** for `"<archetype name> <format> decklist 2026"` to find a sample list
+7. **WebFetch** the sample list — this becomes the skeleton foundation. Use `web-fetch` script as fallback if WebFetch is blocked (browser headers + curl fallback).
+8. If the sample list is found, parse it: `parse-deck --format <fmt> <path> --output <working-dir>/deck.json`
+9. Hydrate: `deck-hydrate <working-dir>/deck.json [--bulk-data <path>]`
+
+**Fallback if no sample list is obtainable:**
+- Ask the user to paste a decklist directly — most players can copy one from MTGGoldfish, Moxfield, or similar sites
+- If the user can't provide one, proceed to the Original/Off-Meta path below and build from scratch using the archetype name as a guide for `card-search` queries
+
+##### Original/Off-Meta Path
+
+1. Use the user's playstyle, colors, and pet cards as starting constraints
+2. `card-search --format <fmt> --bulk-data <path> --oracle "<keyword>" --color-identity <colors>` to find build-around cards
+3. `combo-discover` for combo shells in those colors
+4. WebSearch for `"<format> <archetype/mechanic> deck"` for inspiration
+5. Proceed to Skeleton Generation without a sample list foundation
+
+##### Combo-First Path
+
+1. From the combo chosen in the Combo/Build-Around Discovery, identify the minimum shell:
+   - Combo pieces (must-haves)
+   - Tutors that find combo pieces (format-legal tutors via `card-search`)
+   - Protection for combo assembly (counterspells, discard, hexproof)
+2. Identify the best colors (combo colors + support card availability)
+3. Proceed to Combo-First Skeleton Generation
+
+#### Commander: Commander Analysis
+
+1. **Scryfall lookup** — Run: `scryfall-lookup "<Commander Name>"`
+
+   Read the full oracle text, color identity, CMC, and types. For partner/background pairs, look up both commanders and note how they interact with each other.
+
+2. **EDHREC research** — Run: `edhrec-lookup "<Commander Name>"`
+
+   For partner commanders: `edhrec-lookup "<Commander 1>" "<Commander 2>"`
+
+   Review top cards, high synergy cards, and themes. **Brawl/Arena note:** EDHREC data is sourced from Commander/EDH decks. For Brawl/Historic Brawl, EDHREC recommendations must be legality-checked against the deck's format before including. For Arena decks, also verify cards exist on Arena.
+
+3. **Web research** — Use `WebSearch` for the commander + "deck tech", "strategy", "guide". Use `WebFetch` or the helper script to read strategy articles:
+
+   Run: `web-fetch "<url>" --max-length 10000`
+
+4. **Strategy synthesis** — Summarize the commander's key mechanics, primary strategies, and synergy axes. For partner/background pairs, identify how both commanders contribute to the strategy and where their mechanics overlap or complement each other. Present to the user for validation. If the user defers or has no preference, default to the commander's most popular theme on EDHREC and move forward.
+
+The goal is building enough understanding to make smart category fills — not deep analysis (Phase 2 handles that).
+
+##### EDHREC Fallback
+
+If EDHREC has no data for the commander (new or obscure cards), fall back to:
+
+1. **Local bulk data search** — Use `card-search` to find cards that mechanically synergize with the commander's keywords/oracle text within the commander's color identity. For Arena decks, use `--arena-only`. For paper Brawl, use `--paper-only` to exclude Arena-only digital cards.
+2. **EDHREC theme/archetype data** — Look up the commander's archetype rather than the specific commander. For Brawl/Historic Brawl, legality-check suggestions against the deck's format.
+3. **Format staples** — Fill remaining slots with well-known staples for the color identity and bracket.
+
+#### Outside the Box Path (Commander Only)
+
+##### Mechanics/Outcome Interview (no commander known)
+
+Ask (accepting either or both):
+- "What mechanics excite you?" (open-ended — map to `card-search` oracle patterns and `combo-discover --card` queries)
+- "What kind of outcome do you want?" (map to `combo-discover --result` query, e.g., "infinite tokens", "infinite mana", "mill entire library")
+- "Color preferences?" (or "no preference")
+- "How obscure do you want to go?" (somewhat unusual / very obscure / wildest thing you can find)
+- "How many cards can your combo use?" (tight 2-3 card combos / allow bigger combos / full Rube Goldberg)
+
+**Two discovery strategies based on user input:**
+1. **Mechanics-first:** Use `card-search` with oracle text to find cards matching mechanics, then feed card names to `combo-discover --card "X" --card "Y"`
+2. **Outcome-first:** Use `combo-discover --result "Infinite X"` directly
+3. **Both:** Combine `--result` and `--card` filters
+
+**Obscurity to popularity mapping:**
+- Somewhat unusual: `--sort -popularity`, skip top results, popularity 1000-10000
+- Very obscure: `--sort popularity`, skip 0s, popularity 100-1000
+- Wildest thing: `--sort popularity`, popularity 0-100
+
+**Jankiness to max combo size:**
+- Tight: filter to combos with 3 or fewer cards
+- Allow bigger: 4-5 cards
+- Full Rube Goldberg: no limit
+
+##### Combo Discovery (both paths)
+
+For **commander known + outside the box:** use `combo-discover --color-identity <commander-CI>` to constrain to the commander's colors.
+
+Before presenting, write all combo piece names across all combos to a JSON list and batch-lookup in one call: `scryfall-lookup --batch <combo-pieces.json> --bulk-data <bulk-data-path> --cache-dir <working-dir>/.cache`.
+
+Present 3-5 interesting combos with:
+- Cards involved and oracle text (from the batch-lookup results)
+- What the combo produces
+- Color identity
+- Popularity score (lower = more obscure)
+- Number of cards (jankiness indicator)
+- For each combo piece: note standalone utility. Combo pieces that are dead outside the combo are a risk — flag them.
+
+Ask: "Want to build around one of these, or combine multiple?" If combining, verify color identities are compatible.
+
+##### Commander Fitting (skip if commander already known)
+
+Two-wave search for each selected combo:
+1. **Mechanical fit:** `card-search --is-commander --color-identity <combo-CI> --oracle "<combo-keyword>"` — commanders whose oracle text mentions the combo's mechanics
+2. **Strategic fit:** Use training data to shortlist commanders providing tutoring, draw, recursion, or protection in the combo's color identity. Write all shortlisted names to a JSON list and batch-lookup: `scryfall-lookup --batch <fit-candidates.json> --bulk-data <bulk-data-path> --cache-dir <working-dir>/.cache` (Iron Rule applies).
+
+Also check if any combo piece IS a legendary creature that could be the commander.
+
+Present 2-3 commander options with:
+- How the commander mechanically supports the combo
+- Whether the commander adds a secondary strategy axis
+- EDHREC data if available (may be sparse for obscure commanders)
+
+User picks a combo + commander pairing.
+
+---
+
+### Skeleton Generation (Path B)
+
+#### 60-Card Constructed
+
+##### Starting Point
+
+- **Proven archetype with sample list:** Customize the sample list based on user preferences, budget, and pet cards. This is modification, not from-scratch building.
+- **Original/off-meta or combo-first:** Build from scratch using the template below.
+
+##### Category Template (60-card mainboard)
+
+| Category | Typical Count | Notes |
+|----------|--------------|-------|
+| Threats/Creatures | 12-28 | Varies hugely by archetype (aggro: 28, control: 4-8) |
+| Removal/Interaction | 4-12 | Format-dependent; more in slower formats |
+| Card Advantage | 4-8 | Draw spells, planeswalkers, selection |
+| Utility/Flex | 2-8 | Archetype-specific support |
+| Lands | 20-27 | Constructed land formula (see below) |
+
+**These counts are guidelines, not rules.** Aggressive decks skew toward threats; control decks skew toward interaction and card advantage. The archetype defines the balance.
+
+##### Land Count Formula
+
+Use the constructed land target formula:
+- **Baseline:** 24 lands for a 60-card deck
+- **Ramp adjustment:** -1 land per 2 ramp/mana-acceleration cards
+- **Curve adjustment:** Low curve (avg CMC < 2.5) -> fewer lands; high curve (avg CMC > 3.5) -> more lands
+- **Clamp:** Never below 20, never above 27
+
+Run `mana-audit` after building to verify.
+
+##### Land Base Composition
+
+| Land Type | Budget | Mid-Range | High-End |
+|-----------|--------|-----------|----------|
+| Basics | 10-16 | 6-10 | 2-6 |
+| Dual lands (shock, fast, check) | 4-8 | 8-12 | 8-12 |
+| Fetch lands | 0 | 0-4 | 8-12 |
+| Utility lands | 0-2 | 2-4 | 2-4 |
+
+For Arena formats: Khans fetchlands are available (Pioneer and up), but Zendikar/Onslaught fetches are not. Use the Arena-available mana base (shock lands, fast lands, pathway lands, triomes, Khans fetches for Pioneer/Historic/Timeless).
+
+##### Color Fixing Guidance (60-Card)
+
+The land count formula gives a total, but the color *mix* matters just as much. Use `mana-audit` output (pip demand % vs. land production %) to verify, and follow these rules of thumb:
+
+- **Mono-color:** All basics (plus 2-4 utility lands). Easiest mana base.
+- **2-color:** Match land production to pip demand. If the deck is 60% red pips / 40% white pips, aim for roughly 60/40 red/white sources. A mix of ~8 dual lands + basics in the dominant color usually works.
+- **3+ colors:** Basics alone can't support 3 colors reliably. Dual lands become near-mandatory. Budget permitting, prioritize lands that produce 2+ of your colors untapped (shock lands, fast lands, triomes). The common trap is running too many basics in a 3-color deck — if `mana-audit` flags a color deficit >5%, replace basics with duals that produce the deficient color.
+- **Splash color (5-8 pips):** 4-6 sources of the splash color is usually enough. Pathway lands or dual lands that also produce a main color are ideal.
+- **Untapped sources on key turns:** Aggro decks need nearly all lands untapped on turns 1-3. Control decks can tolerate more tapped lands since they operate at higher CMC.
+
+##### Filling Process (60-Card)
+
+For each category:
+1. If starting from a sample list, evaluate what's already there
+2. `card-search --format <fmt> --bulk-data <path> --oracle "<pattern>" --color-identity <colors>` for candidates
+3. `scryfall-lookup --batch` to verify oracle text of all candidates
+4. Filter by budget (paper: price; Arena: wildcard rarity)
+5. Include pet cards in their appropriate categories
+6. Prioritize format staples and proven performers
+
+##### 4-of vs. Fewer Copies
+
+- **4 copies:** Cards you want every game, core to the strategy
+- **3 copies:** Strong cards you want most games but don't need multiples
+- **2 copies:** Situational cards, legendary permanents, curve-toppers
+- **1 copy:** Silver bullets, tutored targets, high-impact singletons
+
+##### Build Sideboard (Bo3 Only)
+
+The sideboard is 15 cards designed to improve matchups after Game 1.
+
+**Process:**
+1. Identify the top 3-5 archetypes in the metagame (from research)
+2. For each bad matchup, allocate 2-4 sideboard slots:
+   - Anti-aggro: life gain, cheap removal, board wipes
+   - Anti-control: cheap threats, counterspells, card advantage
+   - Anti-combo: disruption, counterspells, graveyard hate
+   - Anti-graveyard: `card-search --format <fmt> --bulk-data <path> --oracle "exile.*graveyard"`
+   - Anti-artifact/enchantment: `card-search --format <fmt> --bulk-data <path> --oracle "destroy.*artifact"`
+3. Prefer versatile cards that help in multiple matchups
+4. Verify all sideboard cards are format-legal via `scryfall-lookup`
+
+**Sideboard card counts:**
+- 2-3 copies of narrow hate cards (graveyard hate, artifact removal)
+- 3-4 copies of flexible answers (extra removal, counterspells)
+- 1-2 copies of alternative win conditions or transformative cards
+
+##### Combo-First Skeleton (60-Card)
+
+- Slot combo pieces first (must-haves)
+- Use `card-search` to find: tutors that find combo pieces, protection for combo assembly, redundant effects
+- Fill remaining categories (threats, removal, card advantage, lands) around the combo core
+- Standard structural verification applies
+
+#### Commander/Brawl/Historic Brawl
+
+##### Default Template
+
+Card counts scale with deck size. The base counts below are for 100-card decks; for 60-card decks, multiply each count by 0.6 and round to the nearest integer.
+
+| Category | 100-card | 60-card | Notes |
+|----------|----------|---------|-------|
+| Commander(s) | 1-2 | 1-2 | Already selected |
+| Lands | 36-38 | 22-23 | Burgess formula scaled: `round((31 + colors + effective_commander_cost) * deck_size / 100)` — read it from `mana-audit`'s `land_band`, don't compute it by hand (ADR-0044: for a self-discounting commander such as The Lord of the Eagles or Ghalta the tool uses the **effective commander cost**, the earliest turn the deck expects to afford it, not the printed mana value) |
+| Ramp | 10 | 6 | Mana rocks, dorks, land-fetch spells |
+| Card draw | 10 | 6 | Prefer draw that aligns with strategy |
+| Targeted removal/disruption | 5-12 | 3-7 | Scaled to the deck's Shape — read the band from `deck-tune`'s `template` |
+| Board wipes | 2-5 | 1-3 | Scaled to the deck's Shape — read the band from `deck-tune`'s `template` |
+| Win conditions | 3-5 | 2-3 | Cards that close out a game |
+| Engine/synergy pieces | 15-20 | 9-12 | Cards that work with the commander |
+| Protection/utility | 8-10 | 5-6 | Counterspells, hexproof, recursion |
+
+##### Template Flexibility
+
+The category counts above are defaults — adjust them after strategy validation to match the user's confirmed direction. Examples:
+
+- **Voltron:** Increase protection/utility, shift engine slots toward equipment/auras
+- **Combo:** Increase card draw and win conditions, add tutor slots
+- **Aggro/tokens:** Reduce board wipes (they hurt you too), increase engine pieces
+- **Control:** Increase interaction across the board, reduce engine pieces
+- **Group hug/politics:** Reduce targeted removal, add political tools to utility
+
+**Hard constraints that don't flex:** Lands and ramp stay at Burgess formula minimums regardless of strategy. Total card count must match the deck's expected size (100 for Commander/Historic Brawl, 60 for Brawl, or the user's specified size).
+
+##### Land Base Composition (Commander/Brawl)
+
+The land count comes from the Burgess formula, but composition matters. Guidelines:
+
+- **Basics:** Enough to be fetched by ramp spells (Cultivate, Kodama's Reach, etc.) and not punished by Blood Moon/Back to Basics. Mono/two-color decks lean heavier on basics.
+- **Color fixing:** Scale to budget and color count:
+  - **Budget ($25-75):** Gain lands, temples (scry lands), tri-lands, check lands, pain lands
+  - **Mid ($75-200):** Add filter lands, battle lands, pathway lands, talismans
+  - **High ($200+):** Shocks, fetches, original duals if budget allows
+- **Arena wildcard tiers:** For Arena decks, ignore dollar tiers and budget by wildcard rarity:
+  - **Tight on wildcards:** Lean on uncommon lands (gain lands, check lands, surveil lands, tri-lands). Accept some tapped lands.
+  - **Moderate wildcards:** Add rare untapped duals (shocks, fast lands, bond lands) for the most important color pairs.
+  - **Plenty of wildcards / high bracket:** Full suite of rare untapped duals, Cavern of Souls if tribal, fetch lands if in format.
+- **Utility lands (2-4):** Lands that synergize with the strategy. Don't overload — utility lands that enter tapped or produce colorless hurt consistency. **In mono-color and 2-color decks, avoid colorless-only utility lands** unless their utility directly supports the commander's strategy.
+- **Command Tower:** Auto-include in 2+ color decks. **In mono-color, Command Tower is strictly worse than a basic** — it can't be fetched by ramp spells and doesn't have the basic land type. Use a basic instead.
+- **Sol Ring:** Auto-include in Commander/EDH on paper. Not legal in Brawl or Historic Brawl.
+
+Run `mana-audit` after filling to verify color balance.
+
+##### Interaction Density
+
+How much interaction a deck wants scales with its **Shape** (aggro / midrange / control / combo), not its power bracket (ADR-0024). Read the bands from `slot-budgets` or `deck-tune`'s `template` rows (`interaction`, `board_wipe`). "Disruption" — counterspells, discard, stax pieces — counts as interaction alongside creature/artifact removal. Extra interaction slots come out of the engine/synergy budget. The bracket governs *permission* (Game Changers, mass land denial, extra turns, two-card combos), never density.
+
+##### Filling Process (Commander/Brawl)
+
+**Wildcard-constrained path (Arena, under 10 combined rare + mythic wildcards):** When the user's rare + mythic wildcard budget totals less than 10, **invert the fill strategy**. Instead of drafting ideal cards and checking ownership after, search the user's collection for owned cards that fit each category first. Only spend wildcard slots on commons and uncommons that fill critical gaps.
+
+**Category fill order matters.** Fill foundational categories first:
+
+1. **Lands** (cheapest to fill, most important to get right)
+2. **Ramp**
+3. **Card draw**
+4. **Targeted removal and board wipes**
+5. **Protection/utility**
+6. **Engine/synergy pieces**
+7. **Win conditions**
+
+**Per category:**
+
+1. Pull candidates from EDHREC high-synergy and top cards for this commander. Supplement with `card-search` to find synergistic cards EDHREC may not surface. For Arena decks, use `--arena-only` and omit `--price-max`. For paper Brawl, use `--paper-only` to exclude Arena-only digital cards.
+2. **Batch-lookup oracle text for all candidates** — write candidate names to a JSON list, then run: `scryfall-lookup --batch <candidates.json> --bulk-data <bulk-data-path> --cache-dir <working-dir>/.cache`. Run `card-summary <cache_path>` to see a compact table. Only `Read` the full cache file for the ~3-5 candidates you're actually deciding between, using `offset`/`limit`.
+3. Filter by budget (cheapest printings, track running price total). For Arena, track wildcard rarity counts instead.
+4. Filter by bracket (avoid Game Changers above target bracket).
+5. Weight by interview preferences.
+6. Weight by commander synergy (from the analysis step).
+7. Include any pet cards the user requested.
+8. Fill remaining slots with format staples appropriate to the color identity and budget.
+
+##### Combo-First Skeleton (Commander)
+
+- Slot combo pieces first (they're the deck's reason to exist)
+- Use `card-search` to find supporting cards: tutors that find combo pieces, protection for combo pieces, redundant effects
+- Note which combo pieces pull double duty vs. which are dead outside the combo
+- Fill remaining categories (ramp, draw, removal, lands) weighted toward the combo's mechanics
+- Standard structural verification applies
+
+---
+
+### Structural Verification (Path B)
+
+Run all four checks in order. If any fail, fix and re-check from the top — each CLI re-hydrates itself against the edited deck automatically.
+
+#### 1. Legality Audit (must PASS)
+
+```
+legality-audit <deck.json> [--bulk-data <path>]
+```
+
+Checks: format legality, copy limits (singleton for Commander/Brawl; 4-of rule + Vintage restricted for constructed), sideboard size (max 15 for constructed), deck minimum. Fix any violations before proceeding.
+
+**Commander/Brawl note:** Historic Brawl bans many Commander staples (Sol Ring, Skullclamp, Hour of Reckoning, Triumph of the Hordes, etc.) that look like obvious includes if you're thinking in Commander terms — this check catches them. Color-identity violations typically mean a card slipped past the commander's identity gate.
+
+#### 2. Price Check (must be within budget)
+
+```
+# Paper
+price-check <deck.json> --budget <budget> --bulk-data <path>
+
+# Arena
+price-check <deck.json> --format <fmt> --medium digital --bulk-data <path>
+```
+
+If over budget, substitute expensive cards with budget alternatives. Re-run after changes. For Arena, "most expensive" means highest rarity — swap rare cards for uncommon alternatives. Watch the `illegal_or_missing` warning line for cards that escaped the legality audit.
+
+#### 3. Deck Stats (verify counts)
+
+```
+deck-stats <deck.json> [--bulk-data <path>]
+```
+
+Verify: total card count matches expected size, land count matches formula target, category distribution looks reasonable, sideboard count (0-15 for constructed).
+
+#### 4. Mana Audit (must PASS or WARN)
+
+```
+mana-audit <deck.json> [--bulk-data <path>]
+```
+
+Uses the Burgess/Karsten formula for Commander/Brawl, constructed land formula for 60-card formats. Checks land count and color balance. FAIL means the mana base needs fixing before proceeding.
+
+**This is a gate — do not present a skeleton that fails any of these checks.** If any check fails and you edit the deck to fix it, re-parse and re-run ALL checks from the top — each tool re-hydrates itself against the edited deck automatically, so there's no separate cache to refresh.
+
+---
+
+### Present Skeleton (Path B)
+
+#### 60-Card Constructed Presentation
+
+Present as a categorized list with brief synergy notes:
+
+```
+## Creatures (24)
+4 Monastery Swiftspear — hasty one-drop, prowess triggers off spells
+4 Eidolon of the Great Revel — punishes low-curve opponents
+...
+
+## Instants/Sorceries (16)
+4 Lightning Bolt — premium removal + face damage
+...
+
+## Lands (20)
+8 Mountain
+4 Inspiring Vantage — untapped on turns 1-3
+...
+```
+
+**Sideboard (Bo3 only):**
+
+```
+## Sideboard (15)
+3 Roiling Vortex — vs. free spells, lifegain decks
+2 Rampaging Ferocidon — vs. token/lifegain strategies
+3 Smash to Smithereens — vs. artifact-heavy decks
+...
+```
+
+#### Commander/Brawl Presentation
+
+Present organized by the builder's categories (lands, ramp, card draw, removal, board wipes, win conditions, engine/synergy, protection/utility). Include brief notes on why key synergy cards were included.
+
+#### Summary Block
+
+```
+Mainboard: 60 cards | Lands: 20 | Avg CMC: 1.85
+Sideboard: 15 cards
+Budget: $45.20 / $50.00 (paper) or 2M/4R/8U/12C (Arena wildcards)
+```
+
+For Commander/Brawl, show:
+- Total card count
+- Land count and Burgess formula target
+- Total estimated cost vs. budget (USD for paper, wildcard table for Arena)
+- Category breakdown
+
+For Arena decks, present a wildcard cost table:
+
+> | Rarity | Skeleton Cost | Budget | Remaining |
+> |--------|--------------|--------|-----------|
+> | Mythic | X | Y | Z |
+> | Rare | X | Y | Z |
+> | Uncommon | X | Y | Z |
+> | Common | X | Y | Z |
+
+#### Ask for Adjustments
+
+Present the skeleton and ask: "Want to make any adjustments before we move on to tuning?"
+
+If the user requests changes, apply them, re-run structural verification, and present again.
+
+---
+
+### Write Output Files (Path B)
+
+1. Deck JSON: `<working-dir>/<deck-name>.json`
+2. Import text: `export-deck <deck.json>` -> `<working-dir>/<deck-name>-export.txt` (Arena formats get `Commander` / `Deck` headers automatically; Moxfield reads both layouts)
+3. Hydrated sidecar already at `<working-dir>/<deck-name>.hydrated.json`, built by whichever CLI ran first (or explicitly via `deck-hydrate`)
+
+After presenting and getting user approval, proceed to **Phase 2: Tuning**.
+
+---
+
+## Phase 2: Tuning
+
+Both paths converge here. The deck JSON is ready; every tool hydrates itself through its sidecar as needed.
+
+---
+
+## Step 1: Baseline Metrics
+
+Run in this order (cheapest-to-fail first):
+
+### 1. Legality Audit
+
+```
+legality-audit <deck.json> [--bulk-data <path>]
+```
+
+Checks: format legality, copy limits (singleton for commander formats, 4-of + Vintage restricted for 60-card), sideboard size, deck minimum, color identity (commander formats). **Must PASS** before continuing. If FAIL, surface violations and ask user how to fix.
+
+### 2. Deck Stats
+
+```
+deck-stats <deck.json> [--bulk-data <path>]
+```
+
+Review: total cards, land count, creature count, ramp count, avg CMC, curve distribution, sideboard total (60-card). Note any obvious red flags. Flag immediately if the total card count does not match the deck's expected size.
+
+Review the `alternative_cost_cards` section. For any card with alternative costs (suspend, adventure, foretell, etc.), note the cost most likely to be used in this deck. Do not evaluate these cards at their CMC alone. Each row's `cost_kind` says what the payment is: `alternative` (paid instead of the mana cost — evoke, flashback, warp, a morph's face-down {3}), `additional` (paid on top of it — buyback, retrace's land discard), `alternative_characteristics` (prototype's smaller mana cost and body), `special_action` (suspend and plot exile it now to cast it free later; turning a morph face up), `ability` (ninjutsu puts it onto the battlefield without casting it), or `other_face` (an adventure's or modal DFC's other half).
+
+### 3. Card Summary
+
+```
+card-summary <deck.json> --nonlands-only
+card-summary <deck.json> --lands-only
+card-summary <deck.json> --sideboard   # 60-card only
+```
+
+Scan mainboard (and sideboard for 60-card) oracle text. Flag cards with alternative costs for adjusted CMC evaluation.
+
+### 4. Mana Audit
+
+```
+mana-audit <deck.json> [--bulk-data <path>]
+```
+
+Notes land count status (PASS/WARN/FAIL) and color balance. Uses the Burgess/Karsten formula for commander formats and the constructed formula for 60-card formats.
+
+### 5. Companion Check (60-card only)
+
+Check the sideboard for a Companion card (`card-summary <deck.json> --sideboard` and look for the Companion keyword). If one exists, note its deck-building restriction — all proposed changes must continue to meet it.
+
+If no Companion exists, check whether the deck naturally meets one's restriction. Companions are powerful enough that a deck accidentally qualifying for one (e.g., a low-curve aggro deck meeting Lurrus's "no permanents with mana value > 2") should actively consider adding it. Use `card-search --format <fmt> --bulk-data <path> --oracle "Companion" --type "Creature"` to find candidates, then check restrictions against the current deck. If one fits, suggest it in Step 6 as an addition (it takes 1 sideboard slot).
+
+---
+
+## Step 2: User Intake
+
+### Path A (Tune Existing)
+
+Ask via AskUserQuestion:
+
+#### Shared Questions
+
+1. **Experience level** — Beginner / Intermediate / Advanced
+2. **Budget for upgrades** — USD or wildcard budget for changes
+3. **Max swaps** — How many cards are you willing to change?
+4. **Pain points** — What matchups feel bad? What problems do you notice? Or just "general optimization"?
+
+#### 60-Card Constructed
+
+5. **Best-of-One or Best-of-Three?** — Arena only; skip for paper. If Bo1, sideboard tuning is irrelevant — focus entirely on mainboard. Skip Step 6f (Sideboard Evaluation) and the sideboard guide in Step 12.
+6. **Target** — Competitive ladder, FNM, tournament?
+
+#### Commander/Brawl/Historic Brawl
+
+5. **Power bracket** — 1-5, or casual/core/upgraded/optimized/cEDH
+6. **Arena vs. paper?** — For Brawl/Historic Brawl, ask if playing on Arena or paper if unclear.
+
+**Format-specific context to mention when relevant:**
+- **Brawl/Historic Brawl:** No commander damage (Voltron strategies are weaker), starting life is 25 (2-player) or 30 (multiplayer) instead of 40, free first mulligan
+- **Brawl:** Standard card pool — many Commander staples are not legal. Colorless commanders can include any number of basics of one chosen type.
+- **Historic Brawl:** Arena Brawl card pool — broader than Standard but different ban list from Commander
+- **Arena Brawl queues are always 1v1.** Prioritize speed and tempo over politics, evaluate cards for 1v1 combat (not multiplayer table dynamics), expect more counterspells and targeted removal, fewer board wipes. Paper Brawl can be multiplayer — use standard scaling.
+
+#### Arena Wildcard Budgets
+
+For Arena, use compact notation: `NM/NR/NU/NC` (e.g., `2M/4R/8U/12C` = 2 mythic, 4 rare, 8 uncommon, 12 common wildcards).
+
+If the user ran `mtga-import`, check for `wildcards.json` in the working directory before asking about budget.
+
+### Path B (Build from Scratch)
+
+Confirm carry-forward context from Phase 1: format, platform, Bo1/Bo3 (60-card) or bracket (commander), budget (total/spent/remaining), experience level, archetype, Companion (if any), max swaps. Don't re-ask questions already answered.
+
+When arriving from Path B, note both the **total budget** and the **upgrade budget** (total minus skeleton cost). Use the upgrade budget for swap decisions during analysis. Track owned cards separately — they don't count toward either budget.
+
+**Path B default:** Suggest max swaps of 15-20 for a fresh skeleton (user can adjust). Pain points default to "general optimization" unless the user raised specific concerns during Phase 1.
+
+---
+
+## Step 3: Research
+
+### Arena ladder decks: `arena-meta` first
+
+For a deck built for an Arena queue (a digital build of Standard, Pioneer, Historic,
+Timeless, Alchemy, Historic Brawl or Competitive Brawl), the ladder itself is the
+research. Run it before any web search:
+
+```bash
+arena-meta --deck <deck.json> [--bo3] --collection <collection> --wildcards <allowance>
+```
+
+It reads Untapped.gg's Premium meta for the deck's queue (Platinum and up by default,
+`--ranks` to change), from a 24-hour cache it shares with `deck-tune` (ADR-0059):
+
+- the **field**: each meta archetype's share of the matches, i.e. what the deck will face;
+- the **ranking**: meta archetypes by the Wilson lower bound on their win rate, with
+  a Mythic column;
+- the deck's **meta archetype** (by commander on a Brawl ladder, by nonland overlap on
+  a 60-card one) and its **core**: the cards most of its lists run, with average
+  copies;
+- the **buildable** lists your collection reaches within the wildcards.
+
+The first run in a session may say it needs a sign-in. Ask the user to run
+`arena-meta --login` (`! uv run arena-meta --login`), which opens a browser to sign
+in to their Untapped account once.
+
+Then `deck-tune` reads the same cache by default (`--meta auto`). A card under 5% of
+the meta archetype's lists is a low-value cut candidate, a missing core card is a
+`meta_core_missing` add issue, and the scorecard's `meta` section lists both. Web
+search stays the paper path, and the source for the "why" behind what the numbers
+show.
+
+### 60-Card Constructed
+
+#### Path A: Full Research
+
+##### Metagame Context
+
+1. **WebSearch** for `"<format> metagame 2026"` or `"<format> tier list"`
+2. **WebFetch** top results to understand the current metagame landscape
+3. Identify: What are the top 5 archetypes? Where does this deck fit? What are its expected good/bad matchups?
+
+##### Archetype-Specific Research
+
+1. **WebSearch** for `"<deck archetype> <format> sideboard guide"` and `"<deck archetype> <format> matchup guide"`
+2. **WebFetch** strategy articles for sideboard plans and matchup analysis
+3. Compare the user's list to stock/optimized versions of the archetype
+
+#### Path B: Verification Pass
+
+Research was already done in Phase 1. Verify metagame alignment rather than repeating:
+1. Confirm the metagame context from Phase 1 is still the basis for analysis
+2. Note any archetype-specific research findings that inform tuning priorities
+3. Skip redundant WebSearch/WebFetch unless the user raised new concerns
+
+### Commander/Brawl/Historic Brawl
+
+#### Path A: Full Research
+
+##### EDHREC + Web Strategy
+
+Run: `edhrec-lookup "<Commander Name>"`
+
+For partner commanders: `edhrec-lookup "<Commander 1>" "<Commander 2>"`
+
+Also use `WebSearch` for the commander + "deck tech", "strategy", "guide" to find Command Zone, MTGGoldfish, and other content creator analysis.
+
+**Fetching strategy articles:** Use `WebFetch` first. If it returns an empty JS shell or navigation-only content, fall back to the helper script:
+
+Run: `web-fetch "<url>" --max-length 10000`
+
+**Key principle:** Research informs but doesn't dictate. EDHREC popularity doesn't automatically make a card right, and unpopularity doesn't make it wrong.
+
+**Combo discovery (optional):** For deeper exploration beyond what `combo-search` surfaces, use `combo-discover` to find combo lines the deck could support. Search by cards already in the deck (`--card "Key Card"`) or by desired outcomes (`--result "Infinite X"`).
+
+**Brawl format note:** EDHREC data is sourced from Commander/EDH decks. When tuning a Brawl deck, EDHREC recommendations must be legality-checked against the deck's format before recommending. Use `card-search --format <format> --bulk-data <path>` to verify candidates are legal. For Arena decks, also use `--arena-only`.
+
+#### Path B: Verification Pass
+
+Commander analysis was already done in Phase 1. Verify alignment rather than repeating:
+1. Confirm EDHREC findings and strategy synthesis from Phase 1
+2. Note key synergy axes that inform tuning priorities
+3. Skip redundant EDHREC/WebSearch unless the user raised new concerns
+
+### Combo Awareness (All Formats)
+
+```
+combo-search <deck.json> [--bulk-data <path>]
+```
+
+Surface existing combos and near-misses. Note which near-misses could be completed with 1-card additions.
+
+**Before recommending any near-miss as an add, `Read` the full `description` field for that near-miss from the combo-search JSON** (use `offset`/`limit`). The compact text report shows only the card list and the result; the JSON's `description` spells out the activation sequence and frequently names **additional required pieces** not in the card list. Recommending a near-miss without reading its description is an Iron Rule violation.
+
+**Supplement with WebSearch (60-card):** `combo-search` uses Commander Spellbook, which is crowdsourced primarily by Commander players. Combos that are powerful in 1v1 60-card formats but weak in multiplayer Commander may be underrepresented or missing. Search for `"<archetype> combo <format>"` and `"<key card> combo <format>"` to catch format-specific interactions the API might miss.
+
+**Bracket compliance (Commander):** Check combo results against the user's target bracket:
+- **Bracket 1-2:** Intentional two-card infinite combos are prohibited. Flag existing infinite combos as bracket violations. Do NOT suggest near-miss infinite combos as additions.
+- **Bracket 3:** Infinite combos are allowed but should not reliably fire before turn 6.
+- **Bracket 4:** No restrictions on combos.
+
+---
+
+## Step 4: Strategy Alignment
+
+Present your understanding of the deck's:
+- **Game plan:** How does this deck win?
+- **Key cards:** What are the most important cards in the strategy?
+
+### 60-Card Constructed
+
+- **Expected matchups:** Given the metagame, which matchups are favorable/unfavorable?
+- **Role flexibility:** In each matchup, is this deck the aggressor or the defender?
+
+### Commander/Brawl/Historic Brawl
+
+- **Commander mechanics:** Key mechanical interactions the commander enables
+- **Trigger multiplier range:** If relevant, present your estimated multiplier (e.g., "Based on Obeka's 3 base power with typical pump, I'm estimating 3-7 extra upkeeps per hit"). **Ask the user to validate this range.** It feeds into `cut-check` and determines how trigger values are evaluated.
+
+Ask the user to validate or correct. This alignment prevents wasted analysis on swaps that fight the deck's identity.
+
+---
+
+## Step 5: Commander Interaction Audit (Commander/Brawl/Historic Brawl Only)
+
+**Skip this step entirely for 60-card constructed formats.** Mark it `completed` immediately and proceed to Step 6.
+
+Before evaluating individual cards, systematically check for mechanical interactions between the commander and every card in the deck. This step catches synergies that are invisible when reading cards in isolation.
+
+### Keyword Combinations
+
+List the commander's keywords and any keywords granted by cards in the deck. Check every pair for emergent effects:
+- **Evasion stacking:** menace + "can't be blocked by more than one creature" = unblockable. Any blocking restriction combined with a conflicting blocking requirement may create unblockable.
+- **Damage multiplication:** double strike + combat damage triggers = double triggers. Double strike + lifelink = double life. Trample + deathtouch = 1 damage kills, rest tramples over.
+- **Protection stacking:** ward + hexproof, indestructible + regenerate — identify which are redundant vs. complementary.
+
+This applies to all cards, not just the commander. Equipment and auras that grant keywords to the commander are especially important.
+
+### Trigger Multiplication
+
+Identify the commander's core multiplier (extra upkeeps, extra combats, extra turns, extra phases, trigger copying, token doubling, etc.). For EVERY triggered ability in the deck that fires during the multiplied window, calculate its output at 1x, 3x, and 5x the base rate. Present and evaluate the **multiplied** value, not the base value.
+
+A "1 damage to each opponent" trigger looks marginal at 1x. At 5x with 3 opponents, it's 15 damage + 15 life — a legitimate win condition. Evaluate accordingly.
+
+For commanders whose trigger scales with combat damage dealt, explicitly identify **pump as a strategic pillar**. Each +1 power is not just +1 damage — it's +1 trigger of every effect in the multiplied window.
+
+### Feedback Loops
+
+For each card, ask: "Does this card's output feed back into its own input or the commander's trigger condition?" Examples:
+- A +1/+1 counter source on a commander whose trigger scales with power
+- A token creator that increases a count used by another card's scaling ability
+- A theft effect where stolen permanents change type to match a tribal count
+- A card that draws cards in a hand-size-matters deck
+
+Cards with feedback loops are almost always stronger than they appear in isolation. Flag them before the analysis phase.
+
+### Recurring Cards
+
+Identify all cards that return themselves to a usable zone: re-suspend ("exile it with time counters"), buyback, retrace, escape, flashback and the other cast-from-graveyard keywords, a return of the card itself from the graveyard (Bloodghast, Vengevine), and a card that returns itself to your hand (Arcanis the Omnipotent, Grinning Ignus). Evaluate these on their per-game value (total free casts over a typical game), not their per-cast value. A 6-mana spell that re-suspends and gets cast for free every 1-2 turns is a permanent with a triggered ability, not a one-shot. `cut-check`'s `self-recurring` flag reads exactly this; returning *another* card (Eternal Witness) or bouncing something else (Man-o'-War) is not self-recursion, and suspend alone is one delayed cast.
+
+### Commander Multiplication
+
+Identify cards that multiply the commander's impact. Two categories:
+
+**Commander copies** — cards that create token copies or become copies of the commander (Helm of the Host, Spark Double, Clone effects, Mirror March, Followed Footsteps). Non-legendary copies bypass the legend rule and retain all triggered and activated abilities.
+
+**Ability copiers and trigger multipliers** — cards that copy or double the commander's triggered/activated abilities (Strionic Resonator, Rings of Brighthearth, Panharmonicon for ETB commanders, Teysa Karlov for death triggers, Isshin for attack triggers, Seedborn Muse for extra activations).
+
+`cut-check`'s `commander_multiplication` field reads this against **your** commander, the same read the tuner protects cuts with: a copy only counts when it can copy the commander (Kiki-Jiki and Cytoshape copy only a nonlegendary creature, Brudiclad and Esika's Chariot copy tokens, Mirrormade an artifact or enchantment), and a trigger doubler only when its cause reaches one of the commander's triggers (Panharmonicon does nothing for a commander with no enters trigger). Each entry names its kind (`create_token_copy`, `becomes_copy`, `copy_commander_spell`, `copy_triggered_ability`, `copy_activated_ability`, `copy_activated_or_triggered`, `trigger_doubler`) and the card's ability that does it (`clause`). It reads phase's parse of the card, so a card phase can't parse yet, or an effect it parses loosely, can be missed — still read each cut's text yourself. **These cards are force-multipliers.** Treat any card you flag as untouchable when drafting cuts — it should not appear on the cuts list without explicit justification.
+
+Note the scope of `commander_activated_abilities` in that output: it is only populated when the *cut card* copies the commander, and it lists the **commander's own** non-mana activated abilities (loyalty abilities included) that would get doubled. It says nothing about the cut card's abilities. Do not read an empty list as "this cut is safe."
+
+### Zone-Granted Abilities
+
+Some commanders read a zone other than the battlefield. Thranduil, the Elvenking "has all activated abilities of all Elf cards in your graveyard"; Agatha's Soul Cauldron does the same from exile for countered creatures. **This inverts how you evaluate a whole class of cards**: a card's activated ability becomes live without the card ever being cast, so its body, mana cost, and castability stop being the relevant measure.
+
+Check the commander's oracle text for this pattern *before drafting any cuts*. If present:
+
+1. Identify the granted **type** and **zone** (e.g. Elf / graveyard).
+2. Inventory every card in the deck of that type that has an activated ability — that inventory IS the commander's toolbox, and it's the thing the deck is actually built around.
+3. Treat "ways to put those cards into that zone" as a distinct role with its own count (self-mill, looting, discard outlets, tutor-to-graveyard). **Supply and delivery are separate axes** — a deck can have a deep toolbox and no way to load it, which is a delivery problem, not a supply problem. Count both before claiming either is short.
+4. Note the anti-synergies: effects that *exile* your own graveyard or return those cards to hand shrink the toolbox. That is a real cost to weigh, not an automatic disqualifier — most such effects are optional and target any graveyard.
+
+`cut-check` flags matching cuts as `ZONE_GRANTED` and prints a `NOTE:` naming the grant. A changeling card counts as every creature type (CR 702.73a), and only abilities that work on the battlefield are listed: cycling, ninjutsu and graveyard abilities can't be activated by the commander. Consult per-card rulings (`rulings-lookup`) — these grants have non-obvious corner cases. Thranduil's, for instance: *"If an activated ability of an Elf card in your graveyard references the card it's printed on by name, treat Thranduil's instance of that ability as though it referenced Thranduil instead"* (compare CR 201.5), which makes self-referential abilities like Devoted Druid's untap work on the commander.
+
+### Combo Detection
+
+Run: `combo-search <parsed-deck-json> --output /tmp/combo-search.json`
+
+Review existing combos and near-misses. Distinguish:
+- **Game-winning combos** (result contains "infinite" or "win the game"): flag prominently, critical to protect during analysis.
+- **Value interactions** (non-infinite synergies): note as context, but these don't block cuts.
+
+---
+
+## Step 6: Analysis
+
+**Every format — run the deterministic spine first.** One `deck-tune` call replaces the mechanical counting and drafting this step used to do by hand. It runs the same deterministic tuner deck-forge uses (ADR-0023/0029/0054) and returns a **scorecard** + **candidate swaps**; the template and every floor are the deck's family's (the Command Zone bands for a Commander deck; interaction / card draw / an advisory creature count for 60-card), and the Commander-only axes (`commander_fit`, `bracket`) are `null` for a 60-card deck:
+
+```
+deck-tune <deck.json> [--bulk-data <path>] \
+    --bracket <1-5> --max-swaps <N> [--budget <usd> | --wildcards rare=4,uncommon=8] [--medium paper|digital] [--shape <aggro|midrange|control|combo>] [--exclude <name>]... \
+    --output <working-dir>/tune.json
+```
+
+The medium picks the currency: a **paper** build spends `--budget` USD; a **digital** (Arena) build spends `--wildcards` (per-rarity, e.g. `mythic=1,rare=4,uncommon=8,common=8`) and ignores `--budget`. Omit both for an owned-only pass. The medium also picks the candidate pool — paper printings for a paper table, Arena's for a digital build.
+
+Scorecard sections and what each subsumes:
+- **`shape` / `efficiency`** — deck speed + curve/tempo health (the 6a curve read). Each card is read at the cost the deck pays on curve: an unconditional cheaper alternative cost (warp, evoke, dash, blitz, prototype, impending) replaces its printed mana value (`_analysis.costs.effective_mana_value`, read off phase's keywords; the scorecard's `curve` and average both read it, while `deck-stats` keeps reporting printed mana value and lists the alternative costs beside it). Suspend and plot keep the printed value: they pay now and cast turns later, so judge those by hand (the alternative-cost check below).
+- **`template`** — role density vs the family's bands (Commander: lands / ramp / draw / interaction / wipes; 60-card: lands / interaction incl. sweepers / draw, plus an advisory creature count — the old `slot-budgets` pass; 6a + 6b counts). An `advisory` row is a fact beside the verdict, never a deviation. Ramp is judged under the deck's commander (ADR-0051 amendment): a rock whose mana is dead for it fills no ramp slot and is never suggested — Arcane Signet, Mox Amber and Chrome Mox under a colorless commander; The Mightstone and Weakstone's artifact-only mana under a creature commander.
+- **`focus`** — the commander's signal lanes and whether the deck concentrates on them (the old `deck-signals` pass; 6c).
+- **`mana`** — the full mana audit: color balance, Burgess land target, untapped quality.
+- **`curve`** — the per-CMC histogram.
+- **`combos`** — combos + near-misses; combo pieces are auto-protected from the proposed cuts. A near-miss one named card short becomes a `near_miss_combo` issue whose swap adds that card (a game-winning line ranks above dead weight; below target bracket 3 a game-winning near-miss is never suggested).
+- **`commander_multipliers`** — the cards that copy the commander, make an ability it actually has trigger additional times or copy it (CR 603.2d, 707.10 — read off phase's trees, so Panharmonicon counts only for a commander with a matching enters trigger), or lend it activated abilities from another zone, with the reason. They're protected from the proposed cuts like combo pieces.
+- **`meta`** (a digital build of an Arena queue with an `arena-meta` cache; otherwise `null`). It holds the deck's meta archetype on Untapped's ladder, its record and its `core`, the `missing_core` cards (lands included), and the `low_share` cards almost none of its lists run. Those replace EDHREC play rate in the cut ranking. The top missing nonland core cards also appear as `meta_core_missing` issues (ADR-0059). `--meta off` skips it; `--meta "<name>"` picks the archetype.
+- **`bracket`** — the constraint gate when you pass `--bracket` (Game Changers / mass land denial / extra turns / two-card combos vs the target bracket's official allowances; ADR-0030). For a one-on-one game (every Arena build, Competitive Brawl) it passes with a `not_applicable` reason — the brackets are a multiplayer-Commander system.
+- **`swaps`** — budgeted (cut, add) candidate pairs, synergy-ranked (the old `deck-rank` pass). In a one-on-one game (every Arena build) EDHREC play rate never marks a card low-value — EDHREC is multiplayer paper Commander — though it still breaks ties between equal adds.
+
+**Your job is judgment, not counting.** Read the scorecard's `top_issues`, then run the per-card Cut Checklist (6d) on the *candidate swaps* `deck-tune` surfaced — verify oracle text, commander interaction, multiplied trigger values (Step 7 `cut-check`), and combo lines before accepting any swap. The Self-Grill (Step 8) still gates the final proposal, and **you and the user make every final call** (the user drives card choices).
+
+**What deliberately stays OUTSIDE the spine:**
+- `mana-audit <deck.json> --compare <new-deck.json>` for the before/after check in 6g / Step 10 (the scorecard carries the *current* mana read; the comparison is its own call).
+- `archetype-audit` is now **optional** — `focus` answers the commander-coherence question. Reach for `archetype-audit` only to test a specific *named* theme's density or to find bridge cards (capabilities `focus` doesn't provide).
+
+**60-card constructed:** `deck-tune` runs the same spine (its `size` reports a `shortfall` toward 60, never an overflow; a swap's `add` carries `copy` — "go to four" is a swap like any other; the sideboard is never counted and never proposed). The agent-driven analysis below — metagame archetypes, build-around evaluation, the sideboard — stays the judgment layer on top of it.
+
+---
+
+### 6a: Mana Base & Curve Audit
+
+- Land count and ramp pieces (mana rocks, dorks, land-fetching spells)
+- Average CMC of nonland cards
+- Curve distribution
+- `mana-audit` for quantitative check
+- Color balance: pip demand vs. land production
+- Mana base quality: untapped sources on key turns, color fixing
+- Flag: too few/many lands, color deficits, too many tapped lands
+
+**Role-density budgets (deterministic).** *Commander family:* the spine's scorecard `template` section already has the count of each role (lands / ramp / card_draw / interaction / board_wipe) against the Command-Zone band — read it there, don't re-run a separate pass. A role showing `(under)`/`(over)` is a falsifiable signal of where to add or cut. (The standalone `slot-budgets <deck.json> [--bulk-data <path>] [--shape ...]` CLI remains for ad-hoc use, e.g. 60-card constructed — deck size comes from the deck JSON, not a flag — but it's the same budgeter the scorecard runs.)
+
+**Commander formats:** Land count is a hard constraint. Read the band from `mana-audit` (`land_band.floor` / `land_band.top` / `land_band.flood` / `land_band.status`, ADR-0041) and treat the top as the target; never compute Burgess by hand. `status` is `PASS`, `FAIL` (below the floor — the only gating value) or `FLOOD` (above `top + 2`, advisory: over-landed, consider trimming). The `commander_cmc` term is the **effective commander cost** (ADR-0044): for a commander whose own clause reduces its cost by a board quantity (The Lord of the Eagles, Ghalta) it is the earliest turn the deck expects to afford the commander, computed from the deck's own cards on an uninteracted curve, and the JSON's `commander_cost` block shows the per-turn table and a `status` — `modelled`, `none`, or `unmodelled (<why>)` when the clause shape (graveyard counts, conditionals) or a missing IR forced the printed value. If it returns FAIL, you must add lands or cut fewer lands. Proposing a land count below the floor requires `mana-audit` to return PASS or WARN (not FAIL). Proposing a land count below 36 is almost always a FAIL for a commander without a modelled discount.
+
+**60-card constructed:** Uses the constructed land formula. Compare against format-specific expectations.
+
+### 6b: Interaction & Threat Audit
+
+#### Commander/Brawl/Historic Brawl
+
+Read the scorecard's `template` rows for `interaction` and `board_wipe`: the count against the band for the deck's Shape (ADR-0024 — density scales with Shape, not power bracket). A row marked `(under)` is the falsifiable signal to add interaction. "Disruption" includes counterspells, discard, and stax pieces. Then judge the *kind* of interaction against the user's pain points and table: instant-speed vs sorcery, answers to the threats this table actually presents.
+
+#### 60-Card Constructed
+
+- Count removal (targeted + sweepers)
+- Count threats (creatures + planeswalkers + other win conditions)
+- Compare to format expectations (aggro formats need fewer answers; control metas need more)
+- Flag: insufficient interaction for the metagame, redundant removal, missing threat types
+
+### 6c: Archetype Coherence
+
+**Commander-signal pass (Commander/Brawl/Historic Brawl — deterministic).** The spine's scorecard `focus` section already extracts what the commander's ORACLE TEXT cares about (tribes, tokens, sacrifice, graveyard, +1/+1 counters, ETB, etc.) as labeled avenues, and reports whether the deck's engine cards concentrate on them. Read `focus` for the deck's actual lanes — it reads the commander itself (commander-aware), so it's a deterministic starting point for the role grouping below and a partial answer to the commander-shift blind spot noted next. (The standalone `deck-signals <deck.json> [--bulk-data <path>]` CLI surfaces the same lanes for ad-hoc use.)
+
+**Mechanical archetype pass (optional — applies to all formats).** `focus` answers the commander-coherence question for the Commander family. Reach for `archetype-audit` only when you need a capability `focus` doesn't provide: testing a specific *named* theme's density against your own regex, or finding **bridge cards** (cards matching ≥2 themes). When you do run it, counts are in card copies, so 4x Lightning Bolt contributes 4 to `burn`, not 1 — non-singleton formats register larger numbers. For 60-card constructed (no spine), this remains the primary mechanical density baseline.
+
+**Known blind spot.** `archetype-audit` evaluates cards in isolation. It does NOT see commander-induced archetype shifts — a vanilla elf is not creature-removal to the tool even if your commander blights opponents when elves enter. "Whenever an X enters, do Y" / "creatures you control have Z" / cost-reduction and payoff commanders all create emergent categorizations the mechanical pass will miss. Capture those re-categorizations in the per-card analysis that follows. (Step 5 Commander Interaction Audit is the designated place for commander-lens reasoning.)
+
+Useful output fields for decks: **per-theme total** (is the theme present in meaningful volume?), **bridge cards** (cards matching ≥2 themes — synergy glue, protect from cuts), and the `--show-matches` card list. The `by_guild` breakdown and `orphan signal` notes are cube-scale diagnostics — ignore them at single-deck scale.
+
+Run `archetype-audit --list-presets` to browse the catalog (keyword abilities, removal by type, edicts, turn manipulation, blink, and the broad functional category).
+
+#### Commander/Brawl/Historic Brawl
+
+Mechanical pass first:
+
+```bash
+archetype-audit <deck.json> <deck.hydrated.json> \
+    --include-commanders \
+    --preset tokens \
+    --preset sacrifice-outlet \
+    --preset reanimate \
+    --min-density 8 --warn-density 10 \
+    --show-matches
+```
+
+**Always pass `--include-commanders`** for these formats. Without it, the commander itself is silently excluded from the count — and the commander is usually the biggest theme piece in the deck. Use `--theme "name=regex"` for themes without a matching preset. The `--min-density 8 --warn-density 10` values are tuned for ~65 nonlands in a 100-card list; a theme with <8 cards is typically too thin to be a strategic pillar, <10 is thin-by-convention.
+
+Then group cards by commander-aware roles — roles defined by how they work with THIS commander, not generic categories. Analyze each group as a unit.
+
+**For every card, answer:** "How does this card specifically interact with this commander?" Cite the oracle text. The mechanical pass told you the raw density; the per-card analysis tells you whether each card earns its slot.
+
+Analysis dimensions:
+- Synergy with the commander and other cards
+- Mana curve distribution
+- Card type balance (creatures, interaction, ramp, draw)
+- Win conditions
+- Mana base quality
+- Bracket compliance (count Game Changers vs. target bracket)
+- Pain point focus (weight toward user-identified issues)
+- Combo awareness (combo pieces evaluated in context, near-miss cards as candidate additions)
+
+#### 60-Card Constructed
+
+Unlike commander (which anchors on the commander), constructed decks must have a **consistent game plan** visible across the 60 cards.
+
+**Step 1 — Identify the build-around cards.** Every competitive deck has 1-3 cards that define its archetype (e.g., Monastery Swiftspear for burn, Arclight Phoenix for Izzet Phoenix, Amulet of Vigor for Amulet Titan). These are the constructed equivalent of the commander — the cards the deck is built to maximize.
+
+**Step 2 — Evaluate every other card against the build-around.** For each non-land card, it should do at least one of:
+- **Enable** the build-around (tutors, setup, mana acceleration)
+- **Protect** the build-around (counterspells, removal, redundancy)
+- **Complement** the build-around (cards that benefit from the same game state)
+- **Close** the game when the build-around has done its job (win conditions)
+
+Cards that don't clearly fit one of these roles are candidates for cuts.
+
+**Step 3 — Check for orphaned "Plan B" cards.** A common deck-building mistake is including 2-3 cards from a secondary strategy the deck doesn't have the infrastructure to support.
+
+**Step 4 — Mechanical archetype pass.** Run `archetype-audit` with the declared themes:
+
+```bash
+archetype-audit <deck.json> <deck.hydrated.json> \
+    --preset burn --preset counterspell \
+    --min-density 6 --warn-density 8 \
+    --show-matches
+```
+
+Counts are in card copies (4x Lightning Bolt contributes 4 to `burn`). The `--min-density 6 --warn-density 8` values are tuned for ~40 nonlands in a 60-card list. Cards NOT appearing under any theme are candidates for the "orphaned Plan B" bucket from Step 3 — cross-reference the `--show-matches` list against your full card list. For themes without a matching preset, fall back to `--theme "name=regex"`; `card-summary <deck.json> --nonlands-only` remains available for freeform oracle browsing.
+
+**Step 5 — Verify structural consistency:**
+- **Threat density:** Does the deck have enough pressure to close games?
+- **Curve alignment:** Does the curve support the intended speed?
+- **Dead cards:** Cards that don't contribute to the primary game plan?
+- **Mismatch cards:** Cards that belong to a different archetype?
+
+### 6d: Draft Cuts
+
+#### Commander/Brawl/Historic Brawl: Cut Checklist
+
+Before recommending ANY cut, work through this checklist for every candidate. Skipping items is how cards get misjudged.
+
+0. **Full oracle text verification.** Re-read the card's complete oracle text from the deck's hydrated sidecar (`<deck>.hydrated.json`). The `card-summary` table truncates oracle text and is for scanning only.
+
+   **Run this checklist per card, against that card's text.** Generating one bulk oracle dump for all candidates and then reasoning over it in bulk is NOT this step — it degrades into pattern-matching on card names ("that's an anthem", "that's a mana rock") and every clause after the first stops being read. If you build a dump for convenience, you still owe each candidate its own pass.
+
+   **Any dump you build MUST render `card_faces`.** DFC, split, adventure, and omen cards carry their text on faces, not on `oracle_text`. A naive `card["oracle_text"]` renders them as empty and the card gets judged against a blank body with no error raised. Use `mtg_utils.card_classify.get_oracle_text`, which already falls back to the joined faces, and eyeball the dump for empty entries before trusting it.
+
+0.5. **Alternative cost check.** If the card has suspend, foretell, adventure, evoke, flashback, escape, or other alternative casting costs, evaluate at the cost most likely to be used in this deck, not the printed CMC.
+
+1. **Clause-by-clause oracle text analysis.** Read each sentence independently. Ask: "How does THIS specific clause interact with my commander and the deck's strategy?" Common missed clauses:
+   - Attack/block restrictions
+   - Type-changing effects
+   - Self-recurring mechanics
+   - Static effects on other permanents
+
+2. **Defensive value check.** Does this card reduce incoming damage or attacks? Protect other permanents? Deter opponents politically?
+
+3. **Feedback loop check.** Does removing this card break a self-reinforcing cycle? (See Step 5.) If so, the cut needs much stronger justification.
+
+4. **Pain point regression check.** Does cutting this card make the user's stated problem worse?
+
+5. **Multiplied value calculation.** Calculate the card's output at the commander's expected trigger multiplier (see Step 5). If a trigger looks weak at 1x but kills a player at 5x, it is a win condition, not a role player.
+
+6. **Combo piece check.** Is this card part of an existing combo line (from Step 5 combo search)?
+   - **Game-winning combos:** hard to justify cutting. Valid justifications include "too slow for the bracket" or "bracket violation."
+   - **Value interactions:** a soft consideration, not a hard gate.
+
+7. **Zone-granted ability check.** If the commander reads a non-battlefield zone (see Step 5 > Zone-Granted Abilities), does this card's *activated* ability stay live from that zone? `cut-check` flags these as `ZONE_GRANTED`. A card whose body is unremarkable can still be a key piece — Thranduil, the Elvenking turns Priest of Titania in the graveyard into "{T}: Add {G} for each Elf" on a 5/6 commander. **The card never has to be cast**, so evaluating it as a creature you'd play understates it. Cutting one of these removes a tool from the commander.
+
+8. **Anti-synergy sizing.** When a clause hurts some of your own cards ("players can't pay life…", "can't cast spells from libraries", a symmetric wipe or hate piece), name the affected cards and count them before the anti-synergy decides anything. This applies to adds as much as cuts.
+   - **One or two affected cards is minor.** It earns a play note ("don't fire Sylex with your rocks out"), not a cut or a rejected add.
+   - **Weigh the same clause against the opponent.** A symmetric effect usually hits the deck that relies on it far harder. Karn's Sylex shuts off two cards in a colorless Omnath deck and every fetchland and Phyrexian-mana card in the opponent's.
+   - **It decides only when it hits a lot.** That means the commander, a combo piece, the deck's engine, or a real slice of the deck (roughly five or more cards).
+
+**Cuts — Be Careful.** Before recommending ANY cut, re-read the oracle text of BOTH the card and the commander. Articulate specifically why the card underperforms in THIS deck.
+
+#### 60-Card Constructed: Draft Cuts
+
+For each proposed cut, evaluate:
+
+1. **Oracle text verification** — Read full oracle text from the deck's hydrated sidecar
+2. **Alternative cost check** — Suspend, foretell, etc. change the effective CMC
+3. **Role in the deck** — What role does this card fill? Is there redundancy?
+4. **Matchup impact** — Does cutting this hurt specific matchups?
+5. **Combo line check** — Is this card part of an existing combo? (from Step 3)
+6. **Metagame relevance** — Is this card specifically good/bad in the current metagame?
+7. **Anti-synergy sizing** — Count the cards a self-harming clause actually hits, and weigh it against the opponent, as in the Commander checklist's item 8. One or two affected cards is a play note, not a cut.
+
+**Be careful with cuts.** Re-read oracle text of both the card and its synergy partners. Articulate the specific underperformance.
+
+#### Path B Adaptation: Draft Cuts
+
+For Path B (freshly built skeleton), cuts are cards from the skeleton that the self-grill identifies as suboptimal. The checklist above still applies. There may be zero cuts if the skeleton is sound.
+
+### 6e: Draft Additions
+
+Source candidates from:
+- **60-card:** Metagame research (stock list differences), `card-search`, near-miss combos, WebSearch for archetype-specific tech
+- **Commander:** EDHREC high-synergy cards, web research, `card-search` to find synergistic cards EDHREC may not surface
+
+Run: `card-search --bulk-data <path> --format <fmt> [--color-identity <ci>] [--oracle "<keyword>"] [--price-max <budget-per-card>] --json > candidates.json`
+
+**Rank candidates by synergy (deterministic).** *Commander family:* the spine already proposes synergy-ranked `swaps` (cut+add pairs) — start from those candidate adds; combo pieces are pre-protected from the paired cuts. When you want to rank a *separate* candidate list you sourced yourself (e.g. EDHREC high-synergy picks not in the swap set), feed that `card-search --json` output to `deck-rank <deck.json> candidates.json [--bulk-data <path>]` — the same synergy → price → curve score the spine uses, never EDHREC popularity. Either way you and the user make the final per-card call (the user drives card choices).
+
+For each proposed addition:
+1. Verify format legality and oracle text
+2. Check price (within budget?)
+3. Identify what role it fills
+4. Compare to the card it's replacing
+
+**Before adding any card to the proposed adds list, verify its color identity** (commander formats) or format legality (all formats). Never rely on card name or memory. Cards like Pest Infestation (B/G despite looking like a green card) will slip through without verification.
+
+Recommend the cheapest available printing. Track running cost against budget.
+
+### 6f: Sideboard Evaluation (60-Card Only)
+
+**Skip for Commander/Brawl/Historic Brawl.** Also skip for Bo1 (per Step 2 intake).
+
+Evaluate the current sideboard against the metagame:
+- Does it address the top 3-5 archetypes?
+- Are there dead sideboard slots (cards for matchups that don't exist)?
+- Are there missing answers (common archetypes with no sideboard plan)?
+- Is the sideboard plan clear? (Which cards come in/out for each matchup?)
+
+Draft sideboard changes alongside mainboard changes.
+
+### 6g: Swap Balance Check
+
+After drafting all changes (mainboard + sideboard if applicable):
+- Verify total mainboard stays at expected size (60 or 100)
+- Verify sideboard stays at 15 or fewer (60-card only)
+- Check land count hasn't drifted
+- Check curve hasn't spiked
+- Run `mana-audit <deck.json> --compare <new-deck.json>` to verify color balance maintained
+- Verify budget: `price-check` on proposed additions
+- **Ramp count must stay stable.** Don't cut ramp pieces unless the deck has too many or you're adding equivalent ramp.
+
+If the swaps would damage the mana base, revise before presenting. It is better to make fewer swaps than to break the deck's ability to cast its spells.
+
+---
+
+## Step 7: Pre-Grill Verification
+
+Before the self-grill, verify mechanically. **`proposal-check` runs every gate below in one call** — it builds the preview deck and reports cuts found, size, legality, the land band, budget, combos lost / near-misses closed (WARN when Commander Spellbook is unreachable), and a cut that copies or multiplies the commander (WARN), each PASS / WARN / FAIL, with `cut-check`'s full readout for every commander alongside:
+
+```
+proposal-check <deck.json> --cuts /tmp/cuts.json --adds /tmp/adds.json [--budget <usd> | --wildcards <rarity=N,…>] [--medium digital] [--collection <collection>] --output-dir <wd>
+```
+
+Pass `--collection` on Arena (or any time the adds may already be owned): the deck's `owned_cards` only covers its current cards. A lost game-winning combo FAILs; pass `--allow-combo-loss` only once the cut's justification is written down. Hand its `proposal-check.json` to the Step 8 agents as the mechanical record. The sections below describe each gate and what to do when it fails.
+
+### Legality Check on Additions (HARD GATE)
+
+**Never send the self-grill a proposal that contains banned or color-identity-illegal cards.** The agent has no reliable way to recall ban-list snapshots from training data; running the audit is cheap.
+
+Build a preview deck from the current proposal and audit it:
+
+```
+build-deck <deck.json> --cuts /tmp/cuts.json --adds /tmp/adds.json --bulk-data <path> --output-dir <wd>
+legality-audit <wd>/new-deck.json --bulk-data <path>
+```
+
+`legality-audit` runs with `--cite-rules` on by default, so if a CR file is present in `<wd>` each violation carries a CR rule citation in the JSON.
+
+If the audit is **FAIL**, revise `/tmp/adds.json` or `/tmp/cuts.json` and re-preview before entering Step 8. The Self-Grill subagents must NEVER assert legality from training data — if a Proposer/Challenger thinks a card is legal, the *only* valid proof is a preceding `legality-audit` run whose JSON they can cite.
+
+Concrete miss this gate exists to prevent (session 0a340f10): the Proposer recommended Dockside Extortionist. The Challenger flagged it as a Bracket-policy concern. Neither ran `legality-audit`; both asserted it was Commander-legal. Dockside was in fact banned. Only the post-build audit caught it, wasting a build cycle. Running this gate before Step 8 would have caught it in the right place.
+
+### Price Check on Additions
+
+```
+price-check /tmp/adds.json --bulk-data <path> [--format <fmt>] [--medium digital] [--budget <budget>]
+```
+
+For Arena formats, use `--format <fmt>` to get wildcard costs. If any single card or the total exceeds budget, find cheaper alternatives before proceeding. Do not send cards to the self-grill that the user cannot afford.
+
+### Commander/Brawl/Historic Brawl: Mechanical Cut Check
+
+Run `cut-check` on every proposed cut:
+
+```
+cut-check <deck.json> --cuts <cuts.json> --multiplier-low <low> --multiplier-high <high> --opponents <N> [--bulk-data <path>]
+```
+
+The commander is read from the deck's `commanders` zone by default (first one); pass `--commander "<Name>"` to override — e.g. to check the other half of a partner pair.
+
+Stdout is a compact text report with one line per cut card summarizing flags (`COMMANDER_MULTIPLICATION`, `triggers=N (type=value-range)`, `self-recurring=yes/no`, `keyword-interactions=N`) plus a `Flags:` tally line. `--trigger-type` takes `upkeep`, `attack`, `combat-damage`, `death`, `etb` or `endstep`. Each trigger in the JSON carries its ability `text`, every type it fires on (`types` — Sun Titan's "enters or attacks" is both `etb` and `attack`), and a `base_value` only when the ability yields a fixed number (damage to each opponent counts once per opponent; "gain life equal to…" doesn't parse). A card phase can't parse yet reports no triggers.
+
+For each proposed cut, write out (internally, not presented to user):
+1. **Multiplied value:** [from cut-check output, or "no matching triggers"]
+2. **Pain point regression:** Does cutting this card make the user's stated problem worse?
+3. **Defensive value:** What does this card prevent, deter, or protect?
+4. **Replacement justification:** What specific card in the additions replaces this card's role?
+5. **Combo line:** Is this card part of an *existing* combo from Step 5? If game-winning, justify why cutting is acceptable.
+6. **Near-miss partner check:** Which Step 5 near-miss results does this card enable as a partner? If any, justify the closure or revise the cut.
+
+If you cannot fill in all six fields, you have not evaluated the card. Do not proceed to the self-grill.
+
+### 60-Card Constructed: Internal Evaluation
+
+For each proposed cut, write out (internally, not presented to user):
+- Role in deck
+- Matchup impact
+- Combo line affected?
+- Replacement justification
+- Metagame relevance
+
+If you can't articulate why a specific card should be cut, you haven't evaluated it — don't proceed.
+
+---
+
+## Step 8: Self-Grill (Two-Agent Debate)
+
+**Limited (Path C) variant:** the prompt to both agents is *"rank every viable colour pair from this pool and justify the ordering"* — no candidate pair is named, and the `pool-colors` table (plus `set-scan`) is the input, never a finished decklist. A Challenger handed a predetermined pair only optimises against one build.
+
+**HARD GATE.** Must use two parallel `Agent` tool calls (`subagent_type: "general-purpose"`): one proposer, one challenger, with at least one revision round. This is NOT substituted by mechanical checks (mana-audit, price-check) — those catch quantitative errors; the self-grill catches strategic errors (wrong archetype assessment, missed synergy, weak justification, metagame misread).
+
+### Data Delivery
+
+Give both agents file paths (they can `Read` selectively), plus a one-paragraph bottom-line summary:
+
+**Required file paths:**
+- Deck JSON path (agents can hydrate/re-run any CLI against it themselves)
+- mana-audit output
+- price-check output
+- combo-search output
+- Proposed cuts JSON
+- Proposed adds JSON
+- Sideboard cuts/adds JSON (if any, 60-card only)
+- cut-check output (commander formats only)
+
+**Bottom-line summary example (60-card):**
+"Proposed 8 mainboard swaps + 4 sideboard swaps for Pioneer Mono-Red. mana-audit PASS; price-check $12.50 of $20 budget; combo-search 0 combos (aggro deck). Key thesis: shift from burn-heavy to creature-heavy for better Sheoldred matchup."
+
+**Bottom-line summary example (commander):**
+"cut-check flagged N commander_multiplication + M triggers across the cuts; mana-audit returned PASS/WARN/FAIL; price-check total is $X of $Y budget with Z over-limit cards; combo-search found N game-winning combos in the deck, K of which are affected by the proposed cuts."
+
+**Fallback if `Read` is unavailable.** If a dispatched subagent reports it cannot `Read` the provided path, the parent must paste the relevant file excerpt into a follow-up message to that subagent — never dump the entire file.
+
+### Proposer Instructions
+
+Defend the proposal. Push back on challenger objections unless they provide:
+- Specific oracle text interaction you missed
+- Quantitative argument (mana math, matchup percentage)
+- Metagame data contradicting your read
+
+**Never assert legality from training data.** If you claim a card is legal / banned / restricted, the ONLY valid proof is a preceding `legality-audit` run — cite the JSON output path. Ban lists change (often several times per year); a 6-month-old training snapshot is not authoritative. Step 7 runs a Legality Check HARD GATE on the adds before dispatch; if you're uncertain about any card mid-debate, ask the parent to re-run `legality-audit` on the updated adds.
+
+### Challenger Checklist
+
+The challenger must verify:
+- [ ] Read oracle text for every cut independently (don't trust paraphrasing)
+- [ ] Verify each cut's role — is the replacement actually better in this slot?
+- [ ] **Size every anti-synergy claim** (yours and the proposer's): name the affected cards and count them. An effect that hits one or two of our cards is a play note, not a reason to cut or reject (Step 6d item 8). Also weigh what the same clause does to the opponent.
+- [ ] Check that no critical matchup coverage is lost
+- [ ] **Verify `legality-audit` was run on the proposal (not just the current deck)** — cite the JSON output path. Training-data ban-list claims are never acceptable.
+- [ ] Verify mana-audit is PASS
+- [ ] Verify price-check within budget
+- [ ] Verify no combo lines broken without justification
+- [ ] Verify swap balance (land count, curve, total counts)
+- [ ] **Archetype coherence test:** "Does this deck still have a clear game plan after these swaps?"
+
+#### Additional 60-Card Checks
+
+- [ ] Verify sideboard plan still covers top metagame archetypes
+- [ ] **Companion restriction:** If the deck has a Companion, verify every addition still meets its deck-building restriction
+- [ ] **Sideboard coherence test:** "For each top-3 matchup, what comes in and what goes out? Does that plan make sense?"
+
+#### Additional Commander Checks
+
+- [ ] Check every clause of every cut card's oracle text — defensive restrictions, type-changing effects, self-recurring mechanics, static effects
+- [ ] Verify keyword interactions between the commander and each cut card (emergent combinations)
+- [ ] Calculate multiplied value of any triggers being cut
+- [ ] `Read` the cut-check JSON and verify every flag was addressed by the proposer
+- [ ] Check `color_balance_flags` and per-color metrics
+- [ ] For Brawl formats, scrutinize Voltron strategies extra hard (no commander damage). Account for lower life totals and free mulligan.
+- [ ] **Commander fitness check** — apply the *commander identity test:* "If this deck's commander were hidden, could you guess what it is from the cards?" If the commander may be underperforming, shortlist 1-2 alternatives and surface as a close call in Step 11.
+
+#### Path B Adaptation: Skeleton Review
+
+For Path B (freshly built skeleton), the self-grill debates the skeleton AS A WHOLE, not just proposed changes. The challenger's checklist adds:
+- [ ] **Archetype coherence:** Does the skeleton have a clear, consistent game plan?
+- [ ] **Missing synergies:** Are there obvious synergy cards for this commander/archetype that were overlooked?
+- [ ] **Budget waste:** Are any expensive cards underperforming relative to cheaper alternatives?
+- [ ] **Dead cards:** Cards that don't contribute to the primary strategy?
+- [ ] **Mana base fitness:** Does the mana base support the curve and color demands?
+
+The debate may conclude with zero changes needed. That is a valid outcome for a well-built skeleton.
+
+**Expect 2-3 rounds minimum.** If both agree immediately, the challenger isn't pushing hard enough.
+
+---
+
+## Step 9: Propose Changes
+
+**HARD GATE:** Write the full proposal as a complete turn BEFORE any `AskUserQuestion`. Do not bundle a tool call with proposal markdown — the tool executes before text finalizes, and the user approves blind.
+
+### Before Presenting
+
+Run `build-deck` to construct the new deck, then `mana-audit` on the result. If FAIL, revise until PASS.
+
+**Preferred path: `build-deck` + `export-deck`.** These produce a correctly-sized deck JSON by construction, so manual card counting never enters the loop.
+
+**The user has not seen the debate.** Present the post-debate proposal as a complete, self-contained recommendation with full reasoning for every swap. Do not reference the debate.
+
+### Path B: No Changes Needed
+
+If the self-grill concluded that the skeleton is sound and no changes are needed, skip Steps 9-11 and proceed directly to Step 12.
+
+### Proposal Format
+
+Present as paired swaps with reasoning. Adapt detail to experience level.
+
+**Mainboard changes:**
+```
+## Mainboard Changes (8 swaps)
+
+**OUT: Shock (4) -> IN: Play with Fire (4)**
+Shock deals 2 to any target; Play with Fire deals 2 to any target OR scrys 1 when it
+deals damage to a player. Strictly better in this deck since we point burn at face.
+Cost: $0.50 per copy.
+
+**OUT: Viashino Pyromancer (2) -> IN: Eidolon of the Great Revel (2)**
+Viashino is a one-shot 2 damage on ETB. Eidolon punishes the opponent for every spell
+they cast, often dealing 6-10 damage per game in faster matchups.
+Cost: $3.00 per copy.
+...
+```
+
+**Sideboard changes (60-card only):**
+```
+## Sideboard Changes (4 swaps)
+
+**OUT: Magma Spray (2) -> IN: Roiling Vortex (2)**
+Magma Spray is narrow graveyard removal. Roiling Vortex hits free spells (Fury, Force),
+lifegain (Sheoldred), and deals 1/turn. Better coverage across more matchups.
+Cost: $1.00 per copy.
+...
+```
+
+**Commander format swaps:** Explain why the cut underperforms with THIS commander (cite oracle text) and why the addition is better for the strategy (cite oracle text).
+
+**Budget summary:**
+```
+## Budget
+Total additions: $14.50 / $20.00 budget
+Remaining: $5.50
+```
+
+For Arena wildcard budgets, show per-rarity breakdown.
+
+---
+
+## Step 10: Impact Verification
+
+**HARD GATE.** Run BOTH checks on the new deck before presenting close calls. This step catches emergent regressions — cross-swap interactions visible only after all changes are applied together. Re-running `proposal-check` on the final proposal covers both (its `diff` is `deck-diff`, its `combos` gate compares `combo-search` before and after).
+
+### Check 1: Deck Diff
+
+```
+deck-diff <old-deck.json> <new-deck.json> [--bulk-data <path>]
+```
+
+Verify:
+- Total count unchanged (still 60/100 mainboard, 15 sideboard if applicable)
+- Land count healthy
+- Avg CMC didn't spike
+- Ramp/acceleration count stable
+- Sideboard changes match proposal (60-card)
+
+### Check 2: Combo Search (Post-Build)
+
+```
+combo-search <new-deck.json>
+```
+
+Compare to Step 3/5 results:
+- Any combos lost? If so, was the loss intentional (documented in Step 6d/7)?
+- Any new combos gained?
+- Near-miss changes?
+
+**Non-substitutable with Step 7 combo checks.** Step 7 catches cuts that close *near-miss* lines (pre-build). This Step 10 check catches cuts that break *existing* combo lines (post-build). Neither subsumes the other.
+
+If any unintended regression, revise the proposal.
+
+---
+
+## Step 11: Close Calls
+
+Surface genuinely debatable swaps from the self-grill debate. These are cards where:
+- Proposer and challenger disagreed
+- The decision depends on local metagame or playstyle preference
+- Both options are defensible
+
+Present as user decisions:
+```
+## Close Call: Eidolon of the Great Revel vs. Harsh Mentor
+
+**Case for Eidolon:** Hits every spell, higher floor, proven format staple.
+**Case for Harsh Mentor:** Cheaper at 2 mana, punishes activated abilities (fetchlands,
+planeswalker activations), but doesn't hit spells.
+
+Which do you prefer, or would you like to test both?
+```
+
+Do NOT present obvious decisions as close calls. Only surface genuine disagreements.
+
+### Commander Swap Consideration (Commander/Brawl/Historic Brawl Only)
+
+If the challenger flagged the commander during the self-grill, present it as a close call — never as a firm recommendation:
+
+> "One thing worth considering: [specific observation about why the commander underperforms with this deck's composition]. [Alternative Commander] in the same colors does [specific oracle text interaction] which fits better with what the deck is actually doing. This would be a significant change though — worth exploring, or do you want to keep [current commander]?"
+
+**This is always a close call.** The user chose their commander for a reason.
+
+---
+
+## Step 12: Finalize
+
+### Export
+
+```
+export-deck <new-deck.json>
+```
+
+Outputs Moxfield/Arena import format with sideboard section.
+
+### Final Price Check
+
+```
+price-check <new-deck.json> --bulk-data <path>
+```
+
+For Arena:
+```
+price-check <new-deck.json> --format <fmt> --medium digital --bulk-data <path>
+```
+
+### Final Budget Summary
+
+**Paper:**
+```
+| | Cost |
+|---|---|
+| Skeleton (from builder) | $X |
+| Upgrades (this session) | $Y |
+| **Total deck cost** | **$Z** |
+| Owned cards (not counted) | card1, card2, ... |
+| Total budget | $B |
+| **Remaining** | **$R** |
+```
+
+If Path A (standalone tuner session without a builder phase), show just the upgrade cost and total deck cost.
+
+**Arena:**
+```
+| Rarity   | Used | Available | Remaining |
+|----------|------|-----------|-----------|
+| Mythic   | 1    | 2         | 1         |
+| Rare     | 3    | 4         | 1         |
+| Uncommon | 4    | 8         | 4         |
+| Common   | 6    | 12        | 6         |
+```
+
+### Sideboard Guide (60-Card Only)
+
+Construct a matchup-by-matchup sideboard map for the top 3-5 metagame archetypes identified in Step 3. This is a natural output of the analysis already performed — don't skip it.
+
+```
+## Sideboard Guide
+
+### vs. Mono-Red Aggro (IN: 5, OUT: 5)
+IN: 2 Surge of Salvation, 3 Temporary Lockdown
+OUT: 2 Disdainful Stroke, 1 Negate, 2 Memory Deluge
+Rationale: Trade slow counterspells for cheap answers that stabilize before turn 4.
+
+### vs. Azorius Control (IN: 4, OUT: 4)
+IN: 3 Mystical Dispute, 1 Negate
+OUT: 3 Temporary Lockdown, 1 Surge of Salvation
+Rationale: Sweepers are dead; load up on cheap countermagic for the permission war.
+
+### vs. Graveyard Combo (IN: 3, OUT: 3)
+IN: 3 Rest in Peace
+OUT: 1 Memory Deluge, 2 Absorb
+Rationale: Rest in Peace shuts down the entire strategy; trim expensive interaction.
+```
+
+Each entry must specify exact cards in, exact cards out, and a one-line rationale. The in/out counts must match (total mainboard stays at 60).
+
+### Offer (don't force)
+
+- Mana curve before/after comparison
+- Category breakdown comparison
+- "Next upgrades" list for future budget
+
+---
+
+## Step 13: Empirical Playtest (optional)
+
+Run when the user requests it OR when the deck is "close" between two
+plausible cuts/adds you want empirical signal on.
+
+**Constructed (60-card):** run `playtest-match` against a stock baseline.
+For Modern, the phase repo ships baseline duel decks at
+`crates/phase-ai/duel_decks/modern/{affinity,amulet-titan,boros-energy}.json`.
+Convert your tuned deck and run:
+
+```
+playtest-match my-deck.json affinity.json --games 100 --seed 1 \
+  --output playtest-match.json
+```
+
+**Commander/Brawl:** run `playtest-goldfish` (no widely accepted single
+opponent baseline). Default 1,000 games × 8 turns reports mulligan rate,
+mean lands by turn, mean casts by turn, and color-screw rate.
+
+```
+playtest-goldfish my-deck.json --bulk-data <bulk-data-path> \
+  --games 1000 --turns 8 --output playtest-goldfish.json
+```
+
+**Mana-model approximation — state it when you present goldfish results.** The
+goldfish counts mana from lands + every cast nonland permanent Scryfall marks as
+producing mana. That includes real rocks/dorks (Sol Ring, Signet, Birds) AND
+mana-token makers (Treasure: Pitiless Plunderer, Deadly Dispute; Gold; Eldrazi
+Spawn: Awakening Zone), because Scryfall populates their `produced_mana`. Token
+makers are approximated as a steady **~1 mana/turn** source — the sim does NOT
+simulate their real creation triggers (deaths/attacks/upkeep) or one-shot
+sacrifice, and a multi-color `produced_mana` counts as 1 mana/turn of any color,
+not 5. So token ramp is captured **roughly, not precisely** (timing and
+conditionality aren't modeled). Tell the user the curve/casts are an
+approximation for token-heavy decks.
+
+**Land-search effects ARE modeled** (they were not before — the omission inverted
+color-screw, reporting *more* screw the more fixing a deck ran). A fetch land
+produces the colors of the deck's own basics instead of nothing, and an
+*enters*-triggered fetcher (Wood Elves, Sakura-Tribe Elder) moves a land from
+library to battlefield; both honor an "enters tapped" clause by delaying a turn.
+Fetches behind an activation cost — Knight of the Reliquary's `{T}, Sacrifice a
+Forest`, Burnished Hart's `{3}, {T}, Sacrifice` — are deliberately **not** credited,
+because that cost isn't modeled and free mana would be the worse error. (The cost is
+the reason, not summoning sickness: CR 302.6 scopes that rule to *creatures*, so an
+artifact fetcher could legally tap the turn it enters.)
+A "search … put it into your hand" effect yields no mana now, only a future land drop.
+
+**Reporting back to the user:** present the markdown report from stdout
+verbatim. Do NOT auto-suggest cuts from the result — the user reads the
+report and decides. If the user asks for follow-up ("what should I cut?"),
+treat that as a normal cuts-and-adds iteration with the playtest data
+as new context.
+
+**First-run prereq:** if `playtest-match` errors with "phase binary not
+found", tell the user once: `playtest-install-phase` (~5–10 min, one-time).
+
+---
+
+## Step 14: Print Proxies (optional)
+
+When the user wants to playtest physically:
+
+```bash
+fetch-art --from-deck deck.json --by-name      # ~15s; populates the art catalog
+proxy-print --kind cards  --deck deck.json --out cards.pdf
+proxy-print --kind tokens --deck deck.json --out tokens.pdf
+```
+
+`proxy-print` renders one PDF for the deck's cards and another for
+every token kind the deck produces. `--by-name` lets multi-copy lookalikes
+(e.g. Karplusan Forest vs Sacred Foundry) end up on distinct art.
+See `proxy-printer/SKILL.md` for layout details and catalog setup.
+
+---
+
+## Red Flags
+
+| Thought | Reality |
+|---------|---------|
+| "I know what this card does" | You don't. Look it up. Training data is not oracle text. |
+| "This is a format staple, auto-include" | Verify format legality + oracle text + price. |
+| "EDHREC recommends it so it must be good here" | EDHREC is aggregated data, not analysis. Evaluate for THIS build. |
+| "This is a format staple, it can't be a cut" | Evaluate in context. Staples can underperform in specific shells. |
+| "This card is generally good in Commander" | Generic staples aren't always right. Check synergy with THIS commander. |
+| "This card is generally weak" | Weak in general != weak with this commander. Read both oracle texts. |
+| "The sideboard can wait" | Sideboard is half the competitive advantage. Build it now. (60-card) |
+| "The sideboard is fine, focus on mainboard" | Sideboard wins tournaments. Evaluate it. (60-card) |
+| "The user said aggro, so 20 lands" | Run the formula. Verify with mana-audit. |
+| "I'll just use the sample list as-is" | Customize for budget, pet cards, and user preferences. |
+| "Skip structural verification, it looks right" | Tools catch errors humans miss. Run them. |
+| "This card is cheap on paper so it's fine for Arena" | Paper price != Arena rarity. Use price-check. |
+| "We're over budget but this card is too good to skip" | Budget is a hard constraint. Find a cheaper alternative. |
+| "I'll just fill the rest with staples" | Every card should have a reason. Staples are a last resort, not a shortcut. |
+| "The mana base is probably fine" | Run `mana-audit`. Don't eyeball mana bases. |
+| "This step seems unnecessary for this deck" | Follow every step. The process exists because shortcuts cause mistakes. |
+| "I can skip oracle text verification for well-known cards" | No. Look up every card. Even Sol Ring has oracle text worth reading. |
+| "That's just an anthem / a mana rock / a do-nothing artifact" | You named a category, not the card. Categories are not verdicts. Quote the clause you're cutting on, and quote the clauses you're NOT cutting on, before you decide. |
+| "I read the card, it's a +3/+3 equipment" | Did you read the *rest* of it? Commander's Plate also grants protection from every color outside your identity; Dwynen also has reach and scaling lifegain; Agatha's Soul Cauldron's exile clause is one of three. Ruling on clause 1 and stopping is the single most common way to misjudge a cut. |
+| "I dumped every candidate's oracle text, so I've read them" | A bulk dump is a convenience, not the Cut Checklist. Run the checklist per card. And verify the dump renders `card_faces` — DFCs silently come out blank. |
+| "The tool returned nothing, so there's no issue" | Silence on the commander's defining mechanic is a broken instrument, not a clean bill of health. Ask what the field actually measures before reading an empty list as a pass. |
+| "The deck under-builds X" | Measure it. Run the same count on the current deck and the proposal, and report both. An unmeasured "you're missing X" justifies cuts that destroy X. |
+| "This is the weakest card, it's the obvious cut" | If the reason fits in four words, you haven't done item 1. Cutting to make room for something else is where flippant cuts happen — slow down exactly there. |
+| "Skip the self-grill, the analysis was thorough" | The self-grill catches exactly this overconfidence. Run it every time. |
+| "I ran cut-check + mana-audit + price-check, that covers Step 8" | No. Those are Step 7 *mechanical* gates. Step 8 is the *strategic* gate and requires two Agent tool calls. |
+| "This deck just came from the builder, the self-grill is overkill" | The builder runs no adversarial review. A fresh skeleton is the highest-leverage moment for a challenger pass. |
+| "I'll dispatch the agents next turn / after the user confirms" | No. Step 8 must complete before Step 9. |
+| "I'll bundle the Step 9 proposal and the Step 11 AskUserQuestion in one message" | No. `AskUserQuestion` renders option chips before the surrounding markdown commits, so bundling means the user approves blind. Write Step 9's proposal FIRST as its own turn. |
+| "I'll trust the `rarity` field from the deck's hydrated sidecar for Arena budgeting" | No. That field is the Scryfall "default" printing's rarity. Use `price-check --format <fmt> --medium digital` for Arena rarity. |
+| "I'll check combos in the deck but skip the near-miss partner scan when proposing cuts" | No. A near-miss combo is `<missing> + <partner1> + <partner2> = <result>`. Your cut list may silently target a `partner`. Check every proposed cut against Step 5 near-miss partner slots. |
+| "I'll just Write over `/tmp/cuts.json` and run cut-check in the same message" | No. The first `Write` to an existing `/tmp` path from a prior session fails, but the parallel Bash call runs against stale content. |
+| "I'll write a quick `python3 -c` to count / filter / extract" | Check the decision table first. Almost every common task is covered by an existing script. |
+| "Skip impact verification, the swaps look clean" | Emergent cross-swap effects only visible post-build. Run the checks. |
+| "This card is too expensive to cut" | Sunk cost. Evaluate on merit, not price. |
+| "This card shuts off one of my cards, so it has to go" | Count the cards it hits. One or two out of 99 is a play note. Weigh what the same clause does to the opponent before cutting or rejecting it. |
+| "Propose changes and ask for approval in one message" | Step 9 is its own turn. AskUserQuestion comes in Step 11. |
+| "The mana base is close enough" | Run mana-audit. "Close enough" is how you lose to color screw. |
+| "Cutting this land for a nonland is fine, the deck has enough" | Count the lands. Count the ramp. Do the math. Don't eyeball mana bases. |
+| "I can cut one more land, the ramp covers it" | Run `mana-audit`. If it says FAIL, you cannot. Ramp does not replace lands. |
+| "I understand what this commander wants" | Present your strategic read and ask the user. They play the deck — you don't. |
+| "This card only works with N other cards in the deck" | Check whether the card creates its own enablers. |
+| "This trigger is too small to matter" | Multiply by expected extra triggers AND by number of opponents. Do the math. |
+| "This is redundant evasion/protection" | Before cutting, check for unique mechanical interactions no other card replicates. |
+
+---
+
+## Experience Level Adaptation
+
+| Aspect | Beginner | Intermediate | Advanced |
+|--------|----------|-------------|----------|
+| Interview | Explain all terms, give examples | Use terms with brief context | Use shorthand |
+| Terminology | Define terms (card advantage, tempo, etc.) | Use terms freely | Use shorthand |
+| Metagame explanation | Define archetypes, explain matchups | Name archetypes, note key cards | Assume knowledge, focus on novel angles |
+| Recommendations | Explain why each card matters | Focus on synergy highlights | Category list with brief notes |
+| Swap reasoning | Full sentences, explain why old card is worse | Note specific interaction | Concise: "Bolt > Shock (scry 1 upside)" |
+| Strategy | Explain what the strategy does and why | Explain key interactions | Name the archetype and key cards |
+| Sideboard guide | Explain what sideboarding means | Provide in/out plan per matchup | Shorthand sideboard map |
+| Mana base | Explain land types, what good curve looks like | Note mana base tradeoffs | Focus on marginal improvements |
+| Presentation | Narrative walkthrough with examples | Grouped analysis with notes | Concise tables |
+
+---
+
+## Script Reference
+
+### Core Scripts
+
+- `parse-deck <path> [--format FORMAT] [--deck-size N] [--output PATH]` — Parse deck list. Writes JSON to stdout or `--output` PATH. Supports Moxfield, Arena, MTGO, plain text, CSV. `<path>` must be absolute.
+- `set-commander <deck.json> "Name" ["Name2"]` — Move card to commanders list. Idempotent.
+- `deck-hydrate <deck.json> [--bulk-data <path>]` — Warm/verify the deck's hydrated sidecar (`deck.json` → `deck.hydrated.json`, keyed to the deck's content + bulk identity + version). Stdout is JSON envelope `{sidecar_path, card_count, missing, digest}`. Every other deck CLI hydrates itself the same way, so this is only needed as an explicit checkpoint (inspect `missing`) right after acquisition.
+- `scryfall-lookup --batch <names.json> --bulk-data <path> --cache-dir <dir>` — Hydrate a NAME LIST (candidates, pet cards, combo pieces) — not a deck. Stdout is JSON envelope `{cache_path, card_count, missing, digest}`.
+- `scryfall-lookup "<Card Name>" --bulk-data <path>` — Single card lookup
+- `card-summary <deck.json> [--nonlands-only] [--lands-only] [--type <T>] [--sideboard] [--bulk-data <path>]` — Card table display (mainboard by default). Also accepts a JSON list of card records (e.g. a `scryfall-lookup --batch` `cache_path`), detected by shape.
+- `card-search --bulk-data <path> [--format FORMAT] [--color-identity CI] [--oracle REGEX] [--type TYPE] [--cmc-min N] [--cmc-max N] [--price-min N] [--price-max N] [--sort price-desc] [--limit 25] [--json] [--fields F1,F2,...] [--arena-only] [--paper-only] [--is-commander]` — Search local bulk data
+- `combo-search <deck.json> [--bulk-data <path>] [--max-near-misses N] [--output PATH]` — Find existing combos and near-misses
+- `combo-discover [--card "<name>"] [--result "<outcome>"] [--color-identity CI] [--format FORMAT] [--arena-only] [--paper-only] [--bulk-data PATH] [--output PATH]` — Discover combos by outcome or card
+- `legality-audit <deck.json> [--bulk-data <path>] [--output PATH] [--cite-rules/--no-cite-rules] [--rules-file <path>]` — Check legality, copy limits, sideboard size, deck minimum, color identity
+- `mana-audit <deck.json> [--compare <new-deck.json>] [--bulk-data <path>] [--output PATH]` — Mana base audit (Burgess/Karsten for commander, constructed formula for 60-card)
+- `price-check <deck.json> [--format <fmt>] [--medium paper|digital] --bulk-data <path> [--budget <N>] [--output PATH]` — Budget check. The medium picks the mode: digital (Arena) reports wildcard costs by rarity, paper reports USD. Default: the deck JSON's `medium`, else the format's (Standard and Pioneer default to paper).
+- `deck-stats <deck.json> [--bulk-data <path>] [--output PATH]` — Deck statistics
+- `deck-signals <deck.json> [--bulk-data <path>] [--json]` — The deck's signal lanes (what the commander's oracle text cares about), via the deck-forge detector. Deterministic.
+- `slot-budgets <deck.json> [--bulk-data <path>] [--shape aggro|midrange|control|combo] [--json]` — Role-density bands (lands/ramp/card_draw/interaction/board_wipe) vs the template. Deck size comes from the deck JSON. Deterministic.
+- `deck-rank <deck.json> <candidates.json> [--bulk-data <path>] [--limit N] [--json] [--medium paper|digital] [--meta auto|off|<archetype>]` — Rank candidate records (from `card-search --json`) by synergy with the deck's lanes, then price, then curve. Never EDHREC popularity. On a digital build with a cached `arena-meta` archetype, its card share breaks synergy ties before price (`meta_share` in `--json`; ADR-0059).
+- `build-deck <deck.json> --cuts <c.json> --adds <a.json> [--sideboard-cuts <sc.json>] [--sideboard-adds <sa.json>] [--bulk-data <path>] [--output-dir <dir>]` — Apply changes. Cuts/adds accept `[{name, quantity}]` dicts or plain name strings. Writes `new-deck.json` and its own `new-deck.hydrated.json` sidecar.
+- `deck-diff <old.json> <new.json> [--bulk-data <path>]` — Compare deck versions
+- `export-deck <deck.json> [--style auto|moxfield|arena]` — Export import text with sideboard/companion sections. `auto` (default) emits Arena's `Commander` / `Deck` section headers for Arena formats and bare Moxfield lines otherwise.
+- `mark-owned <deck.json> <collection.csv> [--bulk-data <path>] [--output PATH]` — Mark owned cards. Always pass `--bulk-data` for Arena.
+- `download-mtgjson — Download MTGJSON card data
+- `cut-check <deck.json> --cuts <path> --multiplier-low N --multiplier-high N [--commander "<Name>"] [--trigger-type TYPE ...] [--opponents N] [--bulk-data <path>] [--output PATH]` — Mechanical pre-grill analysis (commander formats only). Commander is read from the deck's `commanders` zone by default; `--commander` overrides.
+- `edhrec-lookup "<Commander Name>" ["<Partner>"]` — EDHREC recommendations (commander formats only)
+- `web-fetch "<url>" --max-length 10000` — Fetch web page with browser headers and curl fallback
+- `find-commanders <parsed.json> --bulk-data <path> [--format FORMAT] [--color-identity CI] [--min-quantity N] [--output PATH]` — Find commander-eligible cards from collection
+- `mtga-import --bulk-data <path> [--log-path PATH] [--output-dir DIR] [--force]` — Extract Arena collection and wildcards from Player.log. Refuses to overwrite a `collection.json` it didn't write (e.g. a `parse-deck` CSV collection) unless `--force`.
