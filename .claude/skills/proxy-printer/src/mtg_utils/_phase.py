@@ -1,0 +1,955 @@
+"""Wrapper around the phase-rs MTG rules engine.
+
+Phase is invoked as a subprocess. We pin the upstream tag, build once into
+a per-user cache, and shell out for every duel/commander run.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import random
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+import urllib.error
+from collections.abc import Callable
+from functools import lru_cache
+from pathlib import Path
+
+from mtg_utils._http import cache_root, urllib_get
+
+# Deliberately its own identity (not mtg_utils._http.USER_AGENT): this
+# fetches from GitHub releases/raw, so it names the phase subsystem
+# specifically rather than the generic Scryfall/EDHREC/Spellbook UA.
+_USER_AGENT = "mtg-skills/_phase"
+
+PHASE_TAG: str = "v0.104.0"  # rewritten by `bump-phase-pin` (ADR-0049)
+PHASE_REPO = "https://github.com/phase-rs/phase"
+
+# Since v0.32.0 releases ship no server tarball; instead a small manifest
+# asset lists the data files (name + sha256 + content-hashed CDN url), and
+# card-data.json is hosted on data.phase-rs.dev. The manifest name embeds the
+# tag, hence a function rather than a constant.
+_CARD_DATA_MANIFEST_ENTRY = "card-data.json"
+
+
+def release_manifest_asset() -> str:
+    """The release asset naming the data files for ``PHASE_TAG``
+    (``release-server-<tag>.json``, schema 1: ``{"data": [{"name", "sha256",
+    "url"}, ...]}``)."""
+    return f"release-server-{PHASE_TAG}.json"
+
+
+class PhaseNotInstalledError(RuntimeError):
+    """Raised when the phase binary cannot be located."""
+
+
+class PhasePrereqError(RuntimeError):
+    """Raised when system prereqs (cargo, git) are missing."""
+
+
+class PhaseRuntimeError(RuntimeError):
+    """Raised when phase exits non-zero. ``stderr`` carries the engine output."""
+
+    def __init__(self, message: str, stderr: str) -> None:
+        super().__init__(message)
+        self.stderr = stderr
+
+
+def cache_dir() -> Path:
+    """Return the phase cache root: ``<cache root>/phase`` (``_http.cache_root``)."""
+    return cache_root() / "phase"
+
+
+def _repo_dir() -> Path:
+    return cache_dir() / "phase.git"
+
+
+def _release_dir() -> Path:
+    return _repo_dir() / "target" / "release"
+
+
+def find_binary(name: str) -> Path:
+    """Locate a phase binary. Honors ``MTG_SKILLS_PHASE_BIN`` for ai-duel.
+
+    For non-default binaries the env override is treated as the directory
+    containing them. When the env override is set, the cache path is NOT
+    consulted as a fallback — set the env, you're on your own.
+    """
+    env_override = os.environ.get("MTG_SKILLS_PHASE_BIN")
+    if env_override:
+        env_path = Path(env_override)
+        if env_path.is_dir():
+            candidate = env_path / name
+        elif env_path.name == name:
+            candidate = env_path
+        else:
+            candidate = env_path.parent / name
+        if candidate.exists():
+            return candidate
+        raise PhaseNotInstalledError(
+            f"Phase binary '{name}' not found at {candidate} "
+            f"(resolved from MTG_SKILLS_PHASE_BIN={env_override}).\n"
+            f"Run `playtest-install-phase` to build phase {PHASE_TAG}, or "
+            f"unset MTG_SKILLS_PHASE_BIN to use the default cache path."
+        )
+
+    candidate = _release_dir() / name
+    if candidate.exists():
+        return candidate
+
+    raise PhaseNotInstalledError(
+        f"Phase binary '{name}' not found at {candidate}.\n"
+        f"Run `playtest-install-phase` to build phase {PHASE_TAG} (~5-10 min)."
+    )
+
+
+def _ensure_prereqs() -> None:
+    """Verify cargo and git are on PATH; raise with a clear message otherwise."""
+    for tool in ("cargo", "git"):
+        if shutil.which(tool) is None:
+            raise PhasePrereqError(
+                f"`{tool}` not found on PATH. "
+                f"Install prereqs: cargo (rustup.rs) and git."
+            )
+
+
+_DUEL_FILES_MARKER = "// matchup-files patch (mtg-skills)"
+
+# The two functions the patch grafts ahead of ai_duel.rs's `fn run_game(`. Plain
+# string (Rust braces are literal here — NOT a Python f-string). Imports it needs
+# (PlayerDeckList / DeckList / resolve_deck_list / CardDatabase / AiDifficulty /
+# PlayerId / Instant) are all already in ai_duel.rs's `use` block.
+_DUEL_FILES_FNS = """\
+// matchup-files patch (mtg-skills): load two phase-native deck files into a
+// 2-player batch, restoring the v0.1.60 --matchup-files affordance v0.8.0 dropped.
+fn read_deck_file(path: &std::path::Path) -> (PlayerDeckList, String) {
+    let file = std::fs::File::open(path).unwrap_or_else(|e| {
+        eprintln!("failed to open deck {}: {e}", path.display());
+        std::process::exit(1);
+    });
+    let v: serde_json::Value = serde_json::from_reader(file).unwrap_or_else(|e| {
+        eprintln!("deck {} is not valid JSON: {e}", path.display());
+        std::process::exit(1);
+    });
+    let label = v["name"].as_str().unwrap_or("deck").to_string();
+    let mut main_deck: Vec<String> = Vec::new();
+    if let Some(arr) = v["main"].as_array() {
+        for e in arr {
+            let n = e["name"].as_str().unwrap_or("");
+            let c = e["count"].as_u64().unwrap_or(1) as usize;
+            for _ in 0..c {
+                main_deck.push(n.to_string());
+            }
+        }
+    }
+    let commander: Vec<String> = v["commander"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    (
+        PlayerDeckList {
+            main_deck,
+            commander,
+            ..Default::default()
+        },
+        label,
+    )
+}
+
+fn run_matchup_files(
+    db: &CardDatabase,
+    a_path: &std::path::Path,
+    b_path: &std::path::Path,
+    batch: Option<usize>,
+    base_seed: u64,
+    difficulty: AiDifficulty,
+    verbose: bool,
+) {
+    let (a_list, p0_label) = read_deck_file(a_path);
+    let (b_list, p1_label) = read_deck_file(b_path);
+    let deck_list = DeckList {
+        player: a_list,
+        opponent: b_list,
+        ..Default::default()
+    };
+    let payload = resolve_deck_list(db, &deck_list);
+
+    let game_count = batch.unwrap_or(1);
+    let mut p0_wins: usize = 0;
+    let mut p1_wins: usize = 0;
+    let mut draws: usize = 0;
+    let mut total_turns: u32 = 0;
+    let mut total_duration_ms: u128 = 0;
+    for game_idx in 0..game_count {
+        let game_seed = base_seed + game_idx as u64;
+        let start = Instant::now();
+        let (winner, turns) = run_game(&payload, game_seed, difficulty, verbose, true);
+        let elapsed = start.elapsed().as_millis();
+        match winner {
+            Some(PlayerId(0)) => p0_wins += 1,
+            Some(_) => p1_wins += 1,
+            None => draws += 1,
+        }
+        total_turns += turns;
+        total_duration_ms += elapsed;
+    }
+    let n = game_count.max(1);
+    eprintln!("\\nResults ({game_count} games, seed {base_seed}, matchup-files):");
+    eprintln!(
+        "  P0 ({p0_label}) wins: {p0_wins:>4} ({:.1}%)",
+        p0_wins as f64 / n as f64 * 100.0
+    );
+    eprintln!(
+        "  P1 ({p1_label}) wins: {p1_wins:>4} ({:.1}%)",
+        p1_wins as f64 / n as f64 * 100.0
+    );
+    eprintln!(
+        "  Draws/aborted:             {draws:>4} ({:.1}%)",
+        draws as f64 / n as f64 * 100.0
+    );
+    eprintln!("  Avg turns: {:.1}", total_turns as f64 / n as f64);
+    eprintln!("  Avg duration: {:.0}ms", total_duration_ms as f64 / n as f64);
+}
+
+"""
+
+
+def _apply_duel_files_patch(repo: Path) -> None:
+    """Re-add a ``--matchup-files <a> <b>`` flag to the cloned ai-duel binary.
+
+    v0.8.0 ai-duel resolves BOTH decks from a static built-in matchup registry — it
+    dropped the v0.1.60 affordance for two arbitrary deck files, so :func:`run_duel`
+    (playtest-match / playtest-gauntlet, 1v1) has no runtime custom-deck path. This
+    grafts the flag back: it loads two phase-native deck files
+    (``{name, main:[{name,count}], commander?}``), resolves them via the engine's
+    ``resolve_deck_list``, and runs the existing 2-player batch (printing the same
+    stderr summary the built-in matchups do). A local build-time graft, idempotent,
+    with asserted anchors so a phase bump fails loudly rather than mis-patching.
+    ADR-0028 consume-not-fork: we still consume the release; this is not a phase PR.
+    """
+    src = repo / "crates" / "phase-ai" / "src" / "bin" / "ai_duel.rs"
+    text = src.read_text()
+    if _DUEL_FILES_MARKER in text:
+        return  # already patched (idempotent)
+    edits = [
+        # 1. declare the option holding the two deck-file paths
+        (
+            'let mut matchup = "red-vs-green".to_string();',
+            'let mut matchup = "red-vs-green".to_string();\n'
+            "    let mut matchup_files: Option<(PathBuf, PathBuf)> = None;  "
+            + _DUEL_FILES_MARKER,
+        ),
+        # 2. parse the flag (two positional values) ahead of the --suite arm
+        (
+            '"--suite" => mode = Mode::Suite,',
+            (
+                '"--matchup-files" => {\n'
+                # Split mid-expression purely to stay under the line limit — the
+                # concatenated value is the Rust source this patch injects verbatim.
+                "                let a = args_iter.next()"
+                ".cloned().unwrap_or_default();\n"
+                "                let b = args_iter.next()"
+                ".cloned().unwrap_or_default();\n"
+                "                matchup_files ="
+                " Some((PathBuf::from(a), PathBuf::from(b)));\n"
+                "            }\n"
+                '            "--suite" => mode = Mode::Suite,'
+            ),
+        ),
+        # 3. dispatch to the custom runner before the built-in mode match
+        (
+            "    match mode {\n",
+            (
+                "    if let Some((ref a, ref b)) = matchup_files {\n"
+                "        run_matchup_files("
+                "&db, a, b, batch, base_seed, difficulty, verbose);\n"
+                "        return;\n"
+                "    }\n\n"
+                "    match mode {\n"
+            ),
+        ),
+        # 4. the runner + deck-file reader, ahead of run_game
+        ("fn run_game(", _DUEL_FILES_FNS + "fn run_game("),
+    ]
+    for anchor, replacement in edits:
+        if text.count(anchor) != 1:
+            raise PhaseRuntimeError(
+                f"ai-duel matchup-files patch anchor not unique/found: {anchor!r}",
+                stderr=(
+                    f"phase {PHASE_TAG} source drifted; update _apply_duel_files_patch."
+                ),
+            )
+        text = text.replace(anchor, replacement, 1)
+    src.write_text(text)
+
+
+def _checked_out_tag(repo: Path) -> str | None:
+    """The tag the clone's HEAD sits on exactly (``git describe --tags
+    --exact-match``), or ``None`` when HEAD is untagged / the query fails."""
+    result = subprocess.run(
+        ["git", "describe", "--tags", "--exact-match", "HEAD"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def install_phase() -> None:
+    """Clone + ``cargo build`` the phase playtest binaries (ai-duel/ai-commander).
+
+    Binaries-only: the Card IR pipeline no longer needs this. ``card-data.json``
+    now comes from :func:`ensure_card_data` (a release-tarball download), so this
+    step is required ONLY to actually playtest (``run_duel`` / ``run_commander``).
+    We still place that downloaded card-data at the repo path the full
+    ``scripts/setup.sh`` would have generated (``client/public/card-data.json``),
+    so the binaries find it — whether they read it at runtime or embed it at
+    build time — WITHOUT running the heavy setup.sh / gen-card-data toolchain.
+    """
+    _ensure_prereqs()
+    repo = _repo_dir()
+    repo.parent.mkdir(parents=True, exist_ok=True)
+
+    if not repo.exists():
+        subprocess.run(
+            ["git", "clone", "--depth=1", "--branch", PHASE_TAG, PHASE_REPO, str(repo)],
+            check=True,
+        )
+    elif _checked_out_tag(repo) != PHASE_TAG:
+        # A clone from an EARLIER pin: move it to the pinned tag rather than
+        # rebuilding stale sources (the v0.66.0 pin bump found the cache still
+        # at v0.45.0 — nothing re-cloned because the directory existed). A
+        # shallow fetch of just the tag keeps the clone small; ``checkout``
+        # restores a pristine ai_duel.rs, so the matchup-files patch below
+        # re-applies from its anchors (it is marker-idempotent either way).
+        subprocess.run(
+            ["git", "fetch", "--depth=1", "origin", "tag", PHASE_TAG],
+            cwd=str(repo),
+            check=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "--force", PHASE_TAG],
+            cwd=str(repo),
+            check=True,
+        )
+
+    # Place the release-tarball card-data where phase expects it, BEFORE the
+    # cargo build (covers both a runtime read and a build-time embed).
+    repo_card_data = repo / "client" / "public" / "card-data.json"
+    repo_card_data.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(ensure_card_data(), repo_card_data)
+
+    # Graft the --matchup-files flag back into ai-duel so run_duel (1v1
+    # playtest-match / playtest-gauntlet) has a runtime custom-deck path.
+    _apply_duel_files_patch(repo)
+
+    subprocess.run(
+        ["cargo", "build", "--release", "--bin", "ai-duel", "--bin", "ai-commander"],
+        cwd=str(repo),
+        check=True,
+    )
+
+    version_file = cache_dir() / "version.txt"
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    version_file.write_text(head + "\n")
+
+
+DEFAULT_COVERAGE_THRESHOLD = 0.9
+
+
+def _card_data_path() -> Path:
+    """The tag-versioned card-data cache path :func:`ensure_card_data` writes.
+
+    Keyed by ``PHASE_TAG`` so a tag bump auto-refetches and old tags stay
+    cached. Decoupled from the cargo build's repo path — building the Card IR
+    sidecar needs only this file, fetched from the release tarball.
+    """
+    return cache_dir() / "card-data" / f"card-data-{PHASE_TAG}.json"
+
+
+# Known-bad card-data records: phase stamps a DIFFERENT card's parse with this
+# oracle_id. Bulk carries TWO distinct cards named "Fast // Furious" —
+# 62411ced (J21/MH2, commander-legal, discard-draw / damage) and 298a6369
+# (playtest, not_legal, haste-unblockable / Fuse) — and phase's name-keyed
+# corpus mis-joins the two; the direction has flipped across pins:
+#   - through v0.45.0: the PLAYTEST card's "Fast" half stamped with the LEGAL
+#     card's oracle_id;
+#   - v0.66.0 (re-censused 2026-08-29): the other way — the LEGAL card's "Fast"
+#     half stamped with the PLAYTEST oracle_id, the legal card with no record
+#     of its own;
+#   - by v0.86.0, and at v0.94.0 (re-censused 2026-09-26): back to the
+#     v0.45.0 direction — the legal card's own "Fast" record is correct under
+#     62411ced, and a SECOND 62411ced record ("fast [62411ced-…]") carries the
+#     playtest card's text; the playtest card has no record of its own (a
+#     plain coverage hole for a not_legal card, not an impostor). The v0.66.0
+#     entry went dead at the v0.86.0 bump unnoticed (it matched nothing, so it
+#     was a no-op) and is replaced below.
+# Keyed by (scryfall_oracle_id, exact oracle_text) so the entry self-retires
+# the moment upstream fixes the join (nothing matches → no-op); a dead entry
+# is REPLACED, never kept beside the live one. A general text-mismatch gate
+# was rejected: the v0.23.0 census found 8 other phase records whose text
+# differed from bulk only by oracle-errata drift (same card, retemplated
+# wording — e.g. Thran Turbine, Elven Farsight) that such a gate would wrongly
+# drop. Census procedure (``bump-phase-pin`` step 5): join every card-data
+# record to bulk by scryfall_oracle_id and flag records whose oracle_text
+# matches NO bulk face text for that oracle_id, then read each row — only a
+# different card's text is an impostor (v0.23.0: 9 flagged = 8 errata-drift +
+# Fast; v0.35.2: exactly 1 flagged = Fast — the weekly MTGJSON refresh phase
+# runs since v0.32.0 cleaned up the errata drift; v0.66.0: exactly 1 flagged =
+# the flipped Fast join; v0.94.0: 52 flagged = 51 errata-drift, phase's
+# MTGJSON a few days newer than the bulk's retemplating, + Fast).
+_IMPOSTOR_RECORDS: frozenset[tuple[str, str]] = frozenset(
+    {
+        (
+            "62411ced-843e-4b63-bdf6-dafb2ac27047",
+            (
+                "Target creature gains haste until end of turn. It can't be "
+                "blocked this turn except by Vehicles or by creatures with "
+                "haste.\nFuse (You may cast one or both halves of this card "
+                "from your hand.)"
+            ),
+        ),
+    }
+)
+
+
+def is_impostor_record(rec: dict) -> bool:
+    """True when ``rec`` is a known-bad card-data record (see
+    :data:`_IMPOSTOR_RECORDS`) — a parse of a DIFFERENT card stamped with this
+    oracle_id upstream. Every ingestion site that groups card-data records by
+    ``scryfall_oracle_id`` must drop these (single seam:
+    ``_card_ir.build._group_by_oracle_id``)."""
+    return (
+        rec.get("scryfall_oracle_id") or "",
+        rec.get("oracle_text") or "",
+    ) in _IMPOSTOR_RECORDS
+
+
+def _fetch_url(url: str) -> bytes:
+    """GET ``url`` (follows redirects), raising ``RuntimeError`` naming the
+    URL + tag on any HTTP/network error."""
+    try:
+        return urllib_get(url, user_agent=_USER_AGENT)
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeError(
+            f"Failed to download phase card-data from {url} (tag {PHASE_TAG}): {exc}"
+        ) from exc
+
+
+def ensure_card_data() -> Path:
+    """Return a local ``card-data.json`` for ``PHASE_TAG``, downloading if absent.
+
+    Returns the tag-versioned cache path (:func:`_card_data_path`). If that file
+    already exists it is returned without any network access. Otherwise the
+    release-server manifest for ``PHASE_TAG`` is fetched from the GitHub
+    release, its ``card-data.json`` entry's content-hashed URL is downloaded,
+    the payload is verified against the manifest's sha256, and written to the
+    cache path atomically. Idempotent. No cargo build / no repo clone required.
+
+    Raises ``RuntimeError`` (naming the URL + tag) on any HTTP, manifest, or
+    checksum error.
+    """
+    dest = _card_data_path()
+    if dest.exists():
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    manifest_url = (
+        f"{PHASE_REPO}/releases/download/{PHASE_TAG}/{release_manifest_asset()}"
+    )
+    try:
+        manifest = json.loads(_fetch_url(manifest_url))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Malformed release manifest at {manifest_url} (tag {PHASE_TAG}): {exc}"
+        ) from exc
+
+    entry = next(
+        (
+            e
+            for e in manifest.get("data", [])
+            if e.get("name") == _CARD_DATA_MANIFEST_ENTRY
+        ),
+        None,
+    )
+    if entry is None or not entry.get("url"):
+        raise RuntimeError(
+            f"'{_CARD_DATA_MANIFEST_ENTRY}' missing from {manifest_url} "
+            f"(tag {PHASE_TAG})."
+        )
+
+    payload = _fetch_url(entry["url"])
+    expected = entry.get("sha256")
+    if expected:
+        actual = hashlib.sha256(payload).hexdigest()
+        if actual != expected:
+            raise RuntimeError(
+                f"card-data.json checksum mismatch from {entry['url']} "
+                f"(tag {PHASE_TAG}): expected {expected}, got {actual}"
+            )
+
+    tmp_dest = dest.with_name(dest.name + ".tmp")
+    tmp_dest.write_bytes(payload)
+    tmp_dest.replace(dest)
+    return dest
+
+
+def _known_tokens_path() -> Path:
+    """The tag-versioned known-tokens.toml cache path :func:`ensure_known_tokens`
+    writes. Keyed by ``PHASE_TAG`` like :func:`_card_data_path`, so a tag bump
+    auto-refetches and old tags stay cached."""
+    return cache_dir() / "known-tokens" / f"known-tokens-{PHASE_TAG}.toml"
+
+
+# task #92 (KNOWN-TOKENS SUBSTRATE): phase's ``card-data.json`` Token effect
+# nodes for PREDEFINED tokens (Saproling, Mutagen, the WOE Role cycle, …) carry
+# only the token's printed body (types/power/toughness/keywords/static
+# abilities it DOES parse) — never the token's own activated/triggered ability
+# text when phase's static-ability parser doesn't decompose it (the Mutagen
+# cycle's sacrifice ability, the Role cycle's granted trigger). That text DOES
+# exist upstream, in ``crates/engine/data/known-tokens.toml``'s per-token
+# ``rules_text`` field (a raw single-file fetch — much lighter than the full
+# release tarball :func:`ensure_card_data` pulls for one member). Unlike that
+# function, this ensure NEVER raises: a missing/unreachable file just means the
+# known-tokens substrate contributes nothing (see
+# ``_card_ir.trees._known_tokens_index``), never a crash.
+_KNOWN_TOKENS_ASSET_PATH = "crates/engine/data/known-tokens.toml"
+
+
+def ensure_known_tokens() -> Path | None:
+    """Return a local ``known-tokens.toml`` for ``PHASE_TAG``, downloading if
+    absent. ``None`` on ANY failure (network, 404, tag missing the file) —
+    graceful by design, mirroring :func:`ensure_card_data`'s tag-keyed cache
+    but with a fail-soft contract instead of a raised ``RuntimeError``, since
+    this substrate is a pure enhancement (a card whose created tokens carry no
+    known-tokens.toml match simply gets no extra ability trees)."""
+    dest = _known_tokens_path()
+    if dest.exists():
+        return dest
+
+    url = (
+        "https://raw.githubusercontent.com/phase-rs/phase/"
+        f"{PHASE_TAG}/{_KNOWN_TOKENS_ASSET_PATH}"
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        payload = urllib_get(url, user_agent=_USER_AGENT, timeout=30)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+    tmp_dest = dest.with_name(dest.name + ".tmp")
+    tmp_dest.write_bytes(payload)
+    tmp_dest.replace(dest)
+    return dest
+
+
+@lru_cache(maxsize=1)
+def load_supported_card_names() -> frozenset[str]:
+    """Load the set of card names phase implements, lowercased for case-insensitive
+    matching (cached).
+
+    phase v0.1.60 ships ``card-data.json`` as a flat ``{name: record}`` dict (keys
+    are phase-normalized, lowercased); older builds used ``{"cards": [{"name": ...}]}``.
+    Handle both. We key off each record's proper-case ``name`` and lowercase it here
+    (and lowercase the deck side in ``coverage_report``) so both sides use the same
+    ``str.lower()`` — reading ``data.get("cards", [])`` against the flat schema
+    returned an empty set, silently marking every card unsupported.
+    """
+    path = ensure_card_data()
+    data = json.loads(path.read_text())
+    if isinstance(data, dict) and isinstance(data.get("cards"), list):
+        raw = [c.get("name", "") for c in data["cards"]]  # legacy {"cards": [...]}
+    elif isinstance(data, dict):
+        raw = [  # flat {name: record} — prefer the record's proper name, else the key
+            rec["name"] if isinstance(rec, dict) and rec.get("name") else key
+            for key, rec in data.items()
+        ]
+    else:
+        raw = [c.get("name", "") for c in data]
+    return frozenset(n.lower() for n in raw if n)
+
+
+def coverage_report(
+    card_names: list[str],
+    *,
+    threshold: float = DEFAULT_COVERAGE_THRESHOLD,
+) -> dict:
+    """Classify a deck's phase coverage as full / warn / blocked.
+
+    - ``full`` (100% supported): run silently.
+    - ``warn`` (>= threshold but < 100%): run with a warning naming missing.
+    - ``blocked`` (< threshold): refuse to run.
+    """
+    supported = load_supported_card_names()
+    requested_set = set(card_names)
+    # Compare case-insensitively (supported names are lowercased) but keep the
+    # original casing in ``missing`` for the user-facing warning.
+    missing = sorted(n for n in requested_set if n.lower() not in supported)
+    matched = len(requested_set) - len(missing)
+    pct = matched / len(requested_set) if requested_set else 1.0
+
+    if not missing:
+        status = "full"
+    elif pct >= threshold:
+        status = "warn"
+    else:
+        status = "blocked"
+
+    return {
+        "status": status,
+        "supported_pct": pct,
+        "missing": missing,
+        "requested": len(requested_set),
+        "supported": matched,
+    }
+
+
+def to_phase_deck(deck: dict, *, label: str) -> dict:
+    """Convert our deck JSON into phase's ``{name, format, main, commander}``
+    shape.
+
+    If ``deck`` is already in phase shape (``main`` present, no ``cards``
+    key), return a shallow copy with the requested ``label``. This lets
+    callers pass the phase repo's bundled duel decks directly.
+    """
+    if "main" in deck and "cards" not in deck:
+        # Already phase-native; just relabel and pass through.
+        out: dict = {
+            "name": label,
+            "format": deck.get("format") or "modern",
+            "main": list(deck["main"]),
+        }
+        if "commander" in deck:
+            out["commander"] = list(deck["commander"])
+        return out
+
+    main_entries: dict[str, int] = {}
+
+    def add(name: str, count: int) -> None:
+        main_entries[name] = main_entries.get(name, 0) + count
+
+    for entry in deck.get("commanders") or []:
+        add(entry["name"], int(entry.get("quantity", 1)))
+    for entry in deck.get("cards") or []:
+        add(entry["name"], int(entry.get("quantity", 1)))
+
+    payload: dict = {
+        "name": label,
+        "format": deck.get("format") or "modern",
+        "main": [{"name": n, "count": c} for n, c in main_entries.items()],
+    }
+    commanders = [e["name"] for e in (deck.get("commanders") or [])]
+    if commanders:
+        payload["commander"] = commanders
+    return payload
+
+
+#: ai-duel prints a batch's summary only when the whole batch ends, so a batch killed
+#: at the timeout reports nothing. :func:`run_duel` therefore runs it as consecutive
+#: chunks: a timeout loses only the chunk in flight. About ten chunks per run, at
+#: least ``_DUEL_MIN_CHUNK`` games each so the per-process start-up (loading
+#: card-data) stays a small share of the time.
+_DUEL_CHUNKS = 10
+_DUEL_MIN_CHUNK = 10
+
+#: Tests replace this to drive the time budget without sleeping.
+_monotonic = time.monotonic
+
+
+def _duel_chunk_size(games: int) -> int:
+    return max(_DUEL_MIN_CHUNK, math.ceil(games / _DUEL_CHUNKS))
+
+
+def _run_budgeted(
+    *,
+    games: int,
+    seed: int | None,
+    timeout_s: int,
+    chunk: int,
+    play: Callable[[int, int, float], None],
+) -> dict:
+    """Play ``games`` as consecutive chunks of at most ``chunk`` within ``timeout_s``
+    seconds, and return the run's envelope: ``status`` (``ok`` / ``timeout``),
+    ``games`` (= ``games_completed``), ``games_requested``, ``timed_out`` and ``seed``.
+
+    ``play(n, chunk_seed, remaining)`` runs one chunk of ``n`` games seeded
+    ``chunk_seed`` (``seed`` + the index of its first game, so a chunked run plays
+    the games one batch would) with only the ``remaining`` budget, folding its
+    results into the caller's totals; a ``subprocess.TimeoutExpired`` it raises
+    ends the run and keeps every chunk that finished. With no seed, one is drawn
+    here so the chunks don't overlap and the run replays from the seed it reports.
+    """
+    if seed is None:
+        seed = random.SystemRandom().randrange(2**31)
+    deadline = _monotonic() + timeout_s
+    completed = 0
+    timed_out = False
+    while completed < games:
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        n = min(chunk, games - completed)
+        try:
+            play(n, seed + completed, remaining)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            break
+        completed += n
+    return {
+        "status": "timeout" if timed_out else "ok",
+        "games": completed,
+        "games_completed": completed,
+        "games_requested": games,
+        "timed_out": timed_out,
+        "seed": seed,
+    }
+
+
+def _parse_duel_summary(out: str) -> dict:
+    """One batch's stderr summary: win / draw counts and per-game averages."""
+
+    def _int(pat: str) -> int:
+        m = re.search(pat, out)
+        return int(m.group(1)) if m else 0
+
+    def _float(pat: str) -> float:
+        m = re.search(pat, out)
+        return float(m.group(1)) if m else 0.0
+
+    return {
+        "wins_p0": _int(r"P0 \(.*?\) wins:\s*(\d+)"),
+        "wins_p1": _int(r"P1 \(.*?\) wins:\s*(\d+)"),
+        "draws": _int(r"Draws/aborted:\s*(\d+)"),
+        "avg_turns": _float(r"Avg turns:\s*([\d.]+)"),
+        "avg_duration_ms": _float(r"Avg duration:\s*([\d.]+)ms"),
+    }
+
+
+def run_duel(
+    deck_a_path: Path,
+    deck_b_path: Path,
+    *,
+    games: int,
+    seed: int | None,
+    format_: str,  # noqa: ARG001 — phase infers format from deck JSON; kept for call-site symmetry
+    difficulty: str = "Medium",
+    timeout_s: int,
+) -> dict:
+    """Run an ``ai-duel`` batch within ``timeout_s`` seconds and return its results.
+
+    Returned dict: ``wins_p0``, ``wins_p1``, ``draws``, ``avg_turns``,
+    ``avg_duration_ms`` (over the games that finished), ``games`` (= games
+    completed), ``games_completed``, ``games_requested``, ``timed_out``, ``seed``
+    (the base seed used), and ``status`` (``ok``, or ``timeout`` when the budget ran
+    out before every game finished).
+
+    v0.8.0 model: ``ai-duel <data-root> --matchup-files <a> <b> --batch N`` (the
+    ``--matchup-files`` flag is re-grafted by :func:`_apply_duel_files_patch` at
+    install — stock v0.8.0 only resolves built-in matchups). The batch summary is
+    printed to STDERR only when the batch ends (no per-game lines, no ``--output``
+    JSON), so the games run as consecutive chunks (:data:`_DUEL_CHUNKS`) and a
+    timeout keeps every chunk that finished. ai-duel seeds game ``i`` of a batch
+    ``seed + i``, so a chunk starting at game ``k`` runs with ``--seed seed + k``:
+    a chunked run plays exactly the games one batch would, and a seeded run stays
+    reproducible. With no seed, one is drawn here so the chunks don't overlap.
+    ``format_`` is unused (phase reads the format from the deck JSON), kept for
+    call-site symmetry.
+    """
+    binary = find_binary("ai-duel")
+    data_root = _binary_data_root()
+    if not (data_root / "card-data.json").exists():
+        raise PhaseNotInstalledError(
+            f"phase card-data.json not found at {data_root / 'card-data.json'}. "
+            "Run `playtest-install-phase`.",
+        )
+    totals = {"wins_p0": 0, "wins_p1": 0, "draws": 0, "turns": 0.0, "ms": 0.0}
+
+    def play(n: int, chunk_seed: int, remaining: float) -> None:
+        cmd = [
+            str(binary),
+            str(data_root),
+            "--matchup-files",
+            str(deck_a_path),
+            str(deck_b_path),
+            "--batch",
+            str(n),
+            "--difficulty",
+            difficulty,
+            "--seed",
+            str(chunk_seed),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd, check=True, timeout=remaining, capture_output=True, text=True
+            )
+        except subprocess.CalledProcessError as exc:
+            raise PhaseRuntimeError(
+                f"phase ai-duel exited with code {exc.returncode}",
+                stderr=exc.stderr or "",
+            ) from exc
+        batch = _parse_duel_summary(proc.stderr or "")  # summary is on stderr
+        for key in ("wins_p0", "wins_p1", "draws"):
+            totals[key] += batch[key]
+        totals["turns"] += batch["avg_turns"] * n
+        totals["ms"] += batch["avg_duration_ms"] * n
+
+    run = _run_budgeted(
+        games=games,
+        seed=seed,
+        timeout_s=timeout_s,
+        chunk=_duel_chunk_size(games),
+        play=play,
+    )
+    completed = run["games_completed"]
+    return {
+        **run,
+        "wins_p0": totals["wins_p0"],
+        "wins_p1": totals["wins_p1"],
+        "draws": totals["draws"],
+        "avg_turns": round(totals["turns"] / completed, 2) if completed else 0.0,
+        "avg_duration_ms": round(totals["ms"] / completed) if completed else 0,
+    }
+
+
+def _binary_data_root() -> Path:
+    """Directory the playtest binaries read ``card-data.json`` from.
+
+    v0.8.0 ``ai-duel``/``ai-commander`` take a positional *data-root* and read
+    ``<data-root>/card-data.json``. :func:`install_phase` places phase's card-data
+    at ``<repo>/client/public/card-data.json`` (the path the full ``setup.sh``
+    would have generated), so that directory is the data-root.
+    """
+    return _repo_dir() / "client" / "public"
+
+
+def _phase_deck_to_feed_entry(deck: dict) -> dict:
+    """Convert a phase-native deck (:func:`to_phase_deck`) into a commander-feed
+    entry (``{name, commander, main}``).
+
+    The feed loader keys each seat's commander off ``commander`` (a name array);
+    when it's empty it falls back to treating the deck ``name`` as the commander
+    card, so a real commander deck MUST carry ``commander``.
+    """
+    return {
+        "name": deck.get("name", "deck"),
+        "commander": list(deck.get("commander") or []),
+        "main": list(deck.get("main") or []),
+    }
+
+
+# A finished ai-commander game prints "Winner: P<seat>" (or no winner line on a
+# draw/abort) plus "Turns played: N" to stdout — v0.8.0 has no --output JSON.
+_WINNER_RE = re.compile(r"Winner:\s*P(\d+)")
+_TURNS_RE = re.compile(r"Turns played:\s*(\d+)")
+
+
+def run_commander(
+    deck_paths: list[Path],
+    *,
+    games: int,
+    seed: int | None,
+    difficulty: str = "Medium",
+    timeout_s: int,
+) -> dict:
+    """Run ``games`` 4-player FFA games of ``ai-commander`` within ``timeout_s``
+    seconds and return per-seat win counts.
+
+    ``deck_paths`` must have length 4 (phase requires 4 seats). Each is a
+    phase-native deck JSON (see :func:`to_phase_deck`) carrying a ``commander``.
+
+    Returned dict: ``winners_by_seat``, ``draws``, ``avg_turns`` (over the games
+    that finished), ``games`` (= games completed), ``games_completed``,
+    ``games_requested``, ``timed_out``, ``seed`` (the base seed used), and
+    ``status`` (``ok``, or ``timeout`` when the budget ran out before every game
+    finished).
+
+    v0.8.0 model: ``ai-commander <data-root> --feed <feed.json>`` plays ONE game
+    and prints the result to stdout (no ``--decks``/``--games``/``--output``). We
+    synthesize a runtime feed from the four decks and invoke once per game,
+    aggregating the parsed ``Winner: P<seat>`` lines. Each game is a chunk of one
+    under :func:`_run_budgeted`, the budget :func:`run_duel` runs under:
+    ``timeout_s`` covers the whole run, each game gets only what remains, a timeout
+    keeps every game that finished, and game ``g`` runs with ``--seed seed + g``.
+    """
+    if len(deck_paths) != 4:
+        raise ValueError(
+            f"ai-commander requires exactly 4 decks, got {len(deck_paths)}",
+        )
+    binary = find_binary("ai-commander")
+    data_root = _binary_data_root()
+    if not (data_root / "card-data.json").exists():
+        raise PhaseNotInstalledError(
+            f"phase card-data.json not found at {data_root / 'card-data.json'}. "
+            "Run `playtest-install-phase`.",
+        )
+    feed = {
+        "decks": [
+            _phase_deck_to_feed_entry(json.loads(Path(p).read_text()))
+            for p in deck_paths
+        ]
+    }
+    winners = [0, 0, 0, 0]
+    totals = {"draws": 0, "turns": 0}
+    with tempfile.TemporaryDirectory() as td:
+        # An absolute --feed path overrides the data-root join (Rust Path::join
+        # with an absolute path replaces the base), so the feed lives off-root.
+        feed_path = Path(td) / "feed.json"
+        feed_path.write_text(json.dumps(feed))
+
+        def play(_n: int, game_seed: int, remaining: float) -> None:
+            cmd = [
+                str(binary),
+                str(data_root),
+                "--feed",
+                str(feed_path),
+                "--difficulty",
+                difficulty,
+                "--seed",
+                str(game_seed),
+            ]
+            try:
+                proc = subprocess.run(
+                    cmd, check=True, timeout=remaining, capture_output=True, text=True
+                )
+            except subprocess.CalledProcessError as exc:
+                raise PhaseRuntimeError(
+                    f"phase ai-commander exited with code {exc.returncode}",
+                    stderr=exc.stderr or "",
+                ) from exc
+            out = proc.stdout or ""
+            m = _WINNER_RE.search(out)
+            if m and 0 <= int(m.group(1)) < 4:
+                winners[int(m.group(1))] += 1
+            else:
+                totals["draws"] += 1  # no winner line → draw / abort
+            tm = _TURNS_RE.search(out)
+            if tm:
+                totals["turns"] += int(tm.group(1))
+
+        # One game per invocation: each game is a chunk of one.
+        run = _run_budgeted(
+            games=games, seed=seed, timeout_s=timeout_s, chunk=1, play=play
+        )
+    completed = run["games_completed"]
+    return {
+        **run,
+        "winners_by_seat": winners,
+        "draws": totals["draws"],
+        "avg_turns": round(totals["turns"] / completed, 2) if completed else 0.0,
+    }

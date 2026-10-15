@@ -1,0 +1,572 @@
+"""The three diagnostic metrics + the Tier-2 flags.
+
+Efficiency (Shape-aware curve/tempo — NOT per-card power, ADR-0009), Template deviation
+(over the shared ``slot_budgets`` bands), and Focus (Engine-card concentration over the
+deck's signal-derived avenues). Win-cons and protection are Shape-scaled advisory flags
+(ADR-0024). Every readout is transparent (matching deck-forge's gate style); none is an
+opaque score. ``_tuner.issues.top_issues`` ranks the findings by severity — the single
+ordering the swap engine acts on (deck-forge CONTEXT.md, "Tune").
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+from mtg_utils._analysis import signal_keys
+from mtg_utils._analysis.roles import protects
+from mtg_utils._analysis.signal_specs import spec_for
+from mtg_utils._card_ir.crosswalk import (
+    ends_the_game,
+    is_evasive_body,
+    reach_amount,
+    static_def_adds_power,
+    team_buff_sites,
+    unbound_x_reach,
+)
+from mtg_utils._card_ir.trees import trees_for
+from mtg_utils._tuner.calibration import COMMANDER, Calibration
+from mtg_utils._tuner.classify import CardClass
+from mtg_utils.card_classify import card_pt_int, has_evasion, is_creature
+from mtg_utils.formats import Game
+from mtg_utils.theme_presets import get_preset
+
+if TYPE_CHECKING:
+    from mtg_utils._card_ir.crosswalk import ConceptTree
+
+# Signal keys that mirror a hard-counted Spine role (ramp / draw / interaction). Not
+# themes, so focus excludes their avenues: a "Ramp / big mana" avenue full of mana rocks
+# and lands is scaffolding, not a lane the deck is built around. The interaction family
+# has SIBLING removal lanes (exile removal, until-leaves exile, counterspells) that are
+# equally scaffolding — excluding only "removal" let them masquerade as themes (e.g.
+# "Exile removal under-supported theme" for a deck just running Swords / Path).
+_SPINE_AVENUE_KEYS = frozenset(
+    {
+        "ramp",
+        "card_draw_engine",
+        "removal",
+        "exile_removal",
+        "exile_until_leaves",
+        "counter_control",
+    }
+)
+
+# Shape → (lo, hi) nonland average-MV band; ~4.0 is the soft ceiling (waived when the
+# deck cheats costs). Centred ~3.0 per the verified research.
+_AVG_BANDS = {
+    "aggro": (1.8, 2.8),
+    "midrange": (2.5, 3.5),
+    "control": (2.8, 3.8),
+    "combo": (2.0, 3.2),
+}
+_AVG_CEILING = 4.0
+
+# The Game every band below is calibrated at: the 40-life Commander pod (CR 103.4c),
+# where 21 commander damage wins (CR 903.10a). ``win_conditions`` scales from it to the
+# Game the deck actually plays (``Format.game``).
+_CALIBRATION_GAME = Game(
+    medium="paper", life=40, multiplayer=True, commander_damage=True
+)
+_CALIBRATION_LIFE = _CALIBRATION_GAME.life
+
+# The dedicated-closer bands (ADR-0024; floor ~3, archetype-scaled) live on the
+# family's ``Calibration`` at _CALIBRATION_GAME. Both bounds scale with starting life
+# (``_life_scaled``): at 25 life one-on-one, ordinary threats close games and fewer
+# dedicated closers are wanted.
+# An evasive body reads as a closer from this power at _CALIBRATION_LIFE (~7 swings);
+# the threshold scales with life so a 4-power flyer counts at 25 (~6 swings) but not
+# at 40.
+_EVASIVE_CLOSER_POWER = 6
+_EVASIVE_CLOSER_POWER_FLOOR = 3
+# A fixed-amount burn / drain is a closer when one resolution takes at least this share
+# of starting life: 5 at _CALIBRATION_LIFE, 4 at 30, 3 at 25 or 20.
+_BURN_CLOSER_FRACTION = 0.12
+
+# Reach — burn / drain that ends a game — is ONE scope table x ONE amount read
+# (``crosswalk.reads.reach_amount`` over the card's trees). Group scope ("each
+# opponent") counts at any table; single-target scope counts only one-on-one, where
+# "any target" is the finisher "each opponent" is at a pod. A SCALING amount (X, a
+# devotion, a count, a loss repeated X times) is always a closer. A FIXED amount is a
+# closer when one resolution takes ``_BURN_CLOSER_FRACTION`` of starting life in
+# group scope, or the WHOLE starting life in single-target scope (Aetherflux
+# Reservoir's 50 is a one-on-one closer; a bolt is removal, never a closer, even at
+# 25 life). A symmetric "each player" sweep (Earthquake) is neither scope.
+
+
+def _matches(card: dict, preset: str) -> bool:
+    try:
+        return get_preset(preset).matches(card)
+    except KeyError:
+        return False
+
+
+def _life_scaled(value: int, life: int, *, floor: int) -> int:
+    """``value`` (calibrated at ``_CALIBRATION_LIFE``) scaled to ``life``, rounded the
+    same way ``Calibration.scaled`` rounds deck-size scaling (Python's round), never
+    below ``floor``."""
+    return max(floor, round(value * life / _CALIBRATION_LIFE))
+
+
+def _reach_closes(trees: Sequence[ConceptTree], *, game: Game) -> bool:
+    """Burn / drain that closes ``game`` (see the reach table above): each effect's
+    scope paired with the fixed amount that closes from that scope."""
+    group_limit = math.ceil(game.life * _BURN_CLOSER_FRACTION)
+    for tree in trees:
+        unbound = unbound_x_reach(tree)  # an X phase parked (its amount scales)
+        if unbound == "group" or (unbound == "single" and not game.multiplayer):
+            return True
+        for unit in tree.units:
+            for node in unit.iter_typed():
+                reach = reach_amount(unit.node, node)
+                if reach is None:
+                    continue
+                scope, amount = reach
+                if scope == "single" and game.multiplayer:
+                    continue
+                limit = group_limit if scope == "group" else game.life
+                if amount is None or amount >= limit:
+                    return True
+    return False
+
+
+def _one_shot_team_pump(trees: Sequence[ConceptTree]) -> bool:
+    """A one-shot team pump that swings for the win — Overrun, Craterhoof Behemoth,
+    Triumph of the Hordes: the ``team_buff`` lane's keyword grant to your team, from
+    a spell, trigger or activation, that also gives the team +N power. A static
+    anthem (Akroma's Memorial, Always Watching, Glorious Anthem) is board presence,
+    and a one-shot grant with no pump (Azorius Charm's lifelink, Crash Through's
+    trample) is a trick, not a closer."""
+    return any(
+        unit.origin != "static" and static_def_adds_power(sdef)
+        for tree in trees
+        for unit, sdef in team_buff_sites(tree)
+    )
+
+
+def _voltron_pieces(classes: Sequence[CardClass]) -> list[str]:
+    """The equipment / aura cards a voltron plan is made of — walked once per tune, in
+    ``win_conditions``, which keeps the list for the density test, the protected set,
+    and the ``voltron`` flag ``protection`` reuses."""
+    return sorted(
+        c.name
+        for c in classes
+        if _matches(c.record, "equip") or _matches(c.record, "auras")
+    )
+
+
+def _is_voltron(pieces: Sequence[str], deck_size: int, cal: Calibration) -> bool:
+    """Equip/aura density that reads as a voltron plan (shared by the protection
+    advisory and the closer count); never outside a family with the read."""
+    if cal.voltron_pieces is None:
+        return False
+    return len(pieces) >= cal.scaled(cal.voltron_pieces, deck_size)
+
+
+def _slots(cards: Sequence[CardClass]) -> int:
+    """How many deck SLOTS a set of classes fills — copies, not names (a 60-card
+    deck of 4-ofs holds ~15 distinct nonland names; every floor counts slots)."""
+    return sum(c.quantity for c in cards)
+
+
+# ── Efficiency ────────────────────────────────────────────────────────────────
+
+
+def efficiency(
+    classes: Sequence[CardClass],
+    *,
+    shape: str,
+    avg_cmc: float,
+    deck_size: int,
+    cal: Calibration = COMMANDER,
+) -> dict:
+    nonland = [c for c in classes if c.bucket not in ("land", "commander")]
+    ramp_classes = [c for c in classes if "ramp" in c.roles]
+    low_classes = [c for c in nonland if c.cmc <= 2.0]
+    top_classes = [c for c in nonland if c.cmc >= 6.0]
+    ramp_cards = [c.name for c in ramp_classes]
+    low_cards = [c.name for c in low_classes]
+    top_cards = [c.name for c in top_classes]
+    ramp, low, top = _slots(ramp_classes), _slots(low_classes), _slots(top_classes)
+    cheats = _slots([c for c in classes if _matches(c.record, "reanimate")]) >= 2
+
+    lo, hi = _AVG_BANDS.get(shape, _AVG_BANDS["midrange"])
+    if (avg_cmc > _AVG_CEILING and not cheats) or avg_cmc > hi + 0.3:
+        avg_status = "top_heavy"
+    else:
+        avg_status = "ok"
+
+    ramp_want: int | None
+    if cal.ramp_want is None:
+        # Ramp is not an axis for this family (a Burn deck at zero ramp is fine).
+        ramp_want, ramp_status = None, "n/a"
+    else:
+        low_w, mid_w, high_w = cal.ramp_want
+        ramp_want = high_w if avg_cmc >= 3.3 else (low_w if avg_cmc <= 2.6 else mid_w)
+        ramp_want = cal.scaled(ramp_want, deck_size)
+        ramp_status = "low" if ramp < ramp_want - 2 else "ok"
+
+    front_want = cal.scaled(
+        cal.front_want.get(shape, cal.front_want[cal.default_shape]), deck_size
+    )
+    front_status = "thin" if low < round(front_want * 0.7) else "ok"
+
+    top_lo = cal.scaled(cal.top_end[0], deck_size)
+    top_hi = cal.scaled(cal.top_end[1], deck_size)
+    if top < top_lo:
+        top_status = "thin"
+    elif top > top_hi:
+        top_status = "clogged"
+    else:
+        top_status = "ok"
+
+    if avg_status == "top_heavy":
+        verdict = "top-heavy"
+    elif top_status == "clogged":
+        verdict = "top-end clogged"
+    elif top_status == "thin":
+        verdict = "thin top-end"
+    elif front_status == "thin":
+        verdict = "thin early game"
+    else:
+        verdict = "ok"
+
+    return {
+        "verdict": verdict,
+        "avg_mv": {"value": round(avg_cmc, 2), "band": [lo, hi], "status": avg_status},
+        "ramp": {
+            "have": ramp,
+            "want": ramp_want,
+            "status": ramp_status,
+            "cards": ramp_cards,
+        },
+        "front_load": {
+            "have": low,
+            "want": front_want,
+            "status": front_status,
+            "cards": low_cards,
+        },
+        "top_end": {
+            "have": top,
+            "want": [top_lo, top_hi],
+            "status": top_status,
+            "cards": top_cards,
+        },
+        "cost_cheat_waiver": cheats,
+    }
+
+
+# ── Focus ─────────────────────────────────────────────────────────────────────
+
+
+def focus(
+    classes: Sequence[CardClass],
+    *,
+    deck_size: int,
+    deck_signals: Sequence = (),
+    medium: str = "paper",
+    tribal_payoff_subjects: frozenset[str] | None = None,
+    cal: Calibration = COMMANDER,
+    playrate_condemns: bool | None = None,
+) -> dict:
+    # Avenues that are really Spine roles (ramp/draw/removal) are not themes — exclude
+    # them so the deck's mana base + scaffolding can't masquerade as its main lane.
+    excluded = {
+        spec.label
+        for sig in deck_signals
+        if sig.key in _SPINE_AVENUE_KEYS and (spec := spec_for(sig)) is not None
+    }
+
+    def themes(card: CardClass) -> list[str]:
+        return [lbl for lbl in card.served if lbl not in excluded]
+
+    nonland = [c for c in classes if c.bucket not in ("land", "commander")]
+    engine = [c for c in classes if c.bucket == "engine"]
+    engine_pool = _slots(engine)
+
+    # Depth counts NONLAND supporters only (a land is mana base, never theme support) of
+    # genuine theme avenues — engine cards + dual-purpose Spine cards that feed a theme.
+    # Names are listed once; depth counts slots (copies).
+    members: dict[str, list[str]] = {}
+    depth: dict[str, int] = {}
+    for c in classes:
+        if c.bucket == "land":
+            continue
+        for label in themes(c):
+            members.setdefault(label, []).append(c.name)
+            depth[label] = depth.get(label, 0) + c.quantity
+
+    # Two-tier viability (research: 1 main + 1 *sub*-theme; a sub is shallower than the
+    # main, so it gets a lower floor — not the same bar as the main).
+    main_floor = max(1, cal.scaled(cal.focus_main, deck_size))
+    sub_floor = max(1, cal.scaled(cal.focus_sub, deck_size))
+    candidates = sorted(
+        (lbl for lbl, d in depth.items() if d >= sub_floor),
+        key=lambda lbl: depth[lbl],
+        reverse=True,
+    )
+    # Collapse near-duplicate avenues that are really one theme: drop a shallower avenue
+    # ≥80% covered by a deeper one already kept (e.g. Spellslinger / Magecraft).
+    viable: list[str] = []
+    for lbl in candidates:
+        s = set(members[lbl])
+        if any(len(s & set(members[k])) / len(s) >= 0.8 for k in viable):
+            continue
+        viable.append(lbl)
+    mains = [lbl for lbl in viable if depth[lbl] >= main_floor]
+    subs = [lbl for lbl in viable if depth[lbl] < main_floor]
+
+    # Emerging themes: a real-but-under-supported direction (emerging floor ≤ depth <
+    # sub floor) the deck started but didn't commit to — flagged "commit more or cut"
+    # rather than dropped as noise. Deduped against the viable themes (a subset of a
+    # real theme is not its own emerging theme).
+    #
+    # ADR-0040 companion (task #101): an emerging TRIBAL avenue additionally needs a
+    # non-commander payoff card naming the tribe, or changelings (every creature
+    # type — signal_specs._subject_spec folds them into every subject's Serve) SERVE
+    # every tribal avenue that's open at all, manufacturing an emerging flag for
+    # tribes nobody built toward (the "Bird tribal" phantom on a changeling-heavy
+    # deck). Built from ``deck_signals`` (label -> subject, via ``spec_for`` — the
+    # same per-subject dynamic label the avenue itself carries); viable avenues are
+    # untouched (already past a much higher floor) and non-tribal labels never
+    # appear in this map, so the gate is a no-op for them.
+    tribal_subject_of_label: dict[str, str] = {}
+    if tribal_payoff_subjects is not None:
+        for sig in deck_signals:
+            if sig.key != signal_keys.TYPE_MATTERS or not sig.subject:
+                continue
+            spec = spec_for(sig)
+            if spec is not None:
+                tribal_subject_of_label[spec.label] = sig.subject
+
+    emerging_floor = max(1, cal.scaled(cal.focus_emerging, deck_size))
+    emerging: list[str] = []
+    for lbl in sorted(depth, key=lambda x: depth[x], reverse=True):
+        if not emerging_floor <= depth[lbl] < sub_floor:
+            continue
+        s = set(members[lbl])
+        if any(len(s & set(members[k])) / len(s) >= 0.8 for k in viable + emerging):
+            continue
+        subj = tribal_subject_of_label.get(lbl)
+        if (
+            subj is not None
+            and tribal_payoff_subjects is not None
+            and subj not in tribal_payoff_subjects
+        ):
+            continue
+        emerging.append(lbl)
+
+    top2 = viable[:2]
+    in_top2 = _slots([c for c in engine if set(top2).intersection(themes(c))])
+    top2_share = round(in_top2 / engine_pool, 2) if engine_pool else 0.0
+
+    filler_classes = [c for c in nonland if c.bucket == "filler"]
+    filler_cards = [c.name for c in filler_classes]
+    filler = _slots(filler_classes)
+    filler_rate = round(filler / max(1, _slots(nonland)), 2)
+
+    # Low-value Engine cards (``CardClass.low_value``) — the vanilla beater that
+    # "counts" as creature support in a go-wide deck — surfaced as upgrade targets.
+    # Play-rate condemns only where it means something (a paper-EDH population).
+    low_value_classes = [
+        c
+        for c in nonland
+        if c.low_value(
+            medium=medium,
+            # tune passes Calibration.playrate_condemns; without it, the family's.
+            playrate=cal.playrate_meaningful
+            if playrate_condemns is None
+            else playrate_condemns,
+        )
+    ]
+    low_value_cards = [c.name for c in low_value_classes]
+
+    engine_labels = {lbl for c in engine for lbl in themes(c)}
+    stranded = sorted(lbl for lbl in engine_labels if 1 <= depth.get(lbl, 0) <= 2)
+
+    spine_led_floor = max(1, cal.scaled(cal.spine_led, deck_size))
+    if engine_pool < spine_led_floor:
+        verdict = "SPINE-LED"
+    elif len(viable) >= 3:
+        # More than a main + a sub — too many directions competing for the engine slots.
+        verdict = "SPREAD-THIN"
+    elif viable:
+        verdict = "FOCUSED"  # 1 main, or 1 main + 1 sub — the research ideal
+    else:
+        # A substantial engine pool that coheres into no theme at all is scattered.
+        verdict = "SPREAD-THIN"
+
+    return {
+        "verdict": verdict,
+        "engine_pool": engine_pool,
+        "viable_avenues": [
+            {
+                "label": lbl,
+                "depth": depth[lbl],
+                "cards": members[lbl],
+                "tier": "main" if depth[lbl] >= main_floor else "sub",
+            }
+            for lbl in viable
+        ],
+        "mains": mains,
+        "subs": subs,
+        "emerging": [
+            {"label": lbl, "depth": depth[lbl], "cards": members[lbl]}
+            for lbl in emerging
+        ],
+        "main_floor": main_floor,
+        "sub_floor": sub_floor,
+        "top2_concentration": top2_share,
+        "filler": filler,
+        "filler_rate": filler_rate,
+        "filler_cards": filler_cards,
+        "low_value": _slots(low_value_classes),
+        "low_value_cards": low_value_cards,
+        "stranded_avenues": stranded,
+        "_depth": depth,
+    }
+
+
+# ── Template deviation (over the shared slot_budgets) ───────────────────────────
+
+
+def template_deviation(budgets: dict) -> dict:
+    """The hard-counted rows drive the verdict and the issues; an ``advisory`` row
+    (a fact about the deck — a creature count) is reported beside them, never as a
+    deviation to fix (CONTEXT: Template deviation)."""
+    counted = {r: b for r, b in budgets.items() if not b.get("advisory")}
+    short = {r: b for r, b in counted.items() if b["deviation"] < 0}
+    over = {r: b for r, b in counted.items() if b["deviation"] > 0}
+    advisory = {
+        r: b for r, b in budgets.items() if b.get("advisory") and b["deviation"] != 0
+    }
+    return {
+        "verdict": "on-template" if not short and not over else "off-template",
+        "short": short,
+        "over": over,
+        "advisory": advisory,
+        "budgets": budgets,
+    }
+
+
+# ── Tier-2 advisory flags ──────────────────────────────────────────────────────
+
+
+def _is_wincon_card(card: dict, *, game: Game = _CALIBRATION_GAME) -> bool:
+    """Heuristic finisher read over the card's trees (every face), relative to
+    ``game``: its starting life sets the evasive-body and fixed-reach thresholds,
+    and one opponent admits single-target reach (the same finisher "each opponent"
+    is at a pod). A closer is a card that wins or makes another player lose
+    (``reads.ends_the_game`` — not Pact of Negation's self-loss), an extra combat
+    (the ``extra_combats`` key), a one-shot team pump, reach that closes, or a big
+    evasive body (an evasion keyword, landwalk among them — CR 702.14c — or a
+    blocking restriction on itself, CR 509.1b)."""
+    trees = trees_for(card)
+    if any(ends_the_game(tree) for tree in trees):
+        return True
+    if _matches(card, "extra-combats") or _one_shot_team_pump(trees):
+        return True
+    if _reach_closes(trees, game=game):
+        return True
+    power_floor = _life_scaled(
+        _EVASIVE_CLOSER_POWER, game.life, floor=_EVASIVE_CLOSER_POWER_FLOOR
+    )
+    if is_creature(card) and card_pt_int(card) >= power_floor:
+        return has_evasion(card) or any(is_evasive_body(tree) for tree in trees)
+    return False
+
+
+def win_conditions(
+    classes: Sequence[CardClass],
+    *,
+    shape: str,
+    combo_count: int,
+    deck_size: int = 100,
+    game: Game = _CALIBRATION_GAME,
+    cal: Calibration = COMMANDER,
+) -> dict:
+    """Dedicated closers vs the Shape's band (ADR-0024 advisory), read against the
+    ``Game`` the deck plays (``Format.game``). A voltron plan (equip/aura density) is
+    one closer only where 21 commander damage wins (CR 903.10a, Commander's extra
+    loss rule; Brawl games do not use it, CR 903.12h); elsewhere it must deal the
+    whole starting life and is surfaced as ``voltron_needs_real_damage``."""
+    # ADR-0040 §5 (task #100): a Granter granting a closer-grade ability
+    # (team double strike) is ONE closer — the record heuristic alone missed
+    # keyword grants, reading the benchmark deck "2 closers" while it held
+    # team double strike twice.
+    closers = {
+        c.name: c
+        for c in classes
+        if _is_wincon_card(c.record, game=game) or c.grant_closer
+    }
+    cards = sorted(closers)
+    pieces = _voltron_pieces(classes)
+    voltron = _is_voltron(pieces, deck_size, cal)
+    voltron_closer = voltron and game.commander_damage
+    count = _slots(list(closers.values())) + combo_count + (1 if voltron_closer else 0)
+    lo, hi = cal.wincon_target.get(shape, cal.wincon_target[cal.default_shape])
+    lo = _life_scaled(lo, game.life, floor=2)
+    # The band keeps at least one card of width, so a low-life control/combo band
+    # never collapses to "wants 2-2".
+    hi = max(lo + 1, _life_scaled(hi, game.life, floor=2))
+    return {
+        "count": count,
+        "from_combos": combo_count,
+        "cards": cards,  # the heuristic finisher cards (combos add to count, not names)
+        "target": [lo, hi],
+        "status": "low" if count < lo else "ok",
+        "life": game.life,
+        "multiplayer": game.multiplayer,
+        # The one voltron read (equip/aura density); ``protection`` takes it from here
+        # rather than walking the pieces again.
+        "voltron": voltron,
+        # The commander-damage plan counted as one closer (CR 903.10a applies), and
+        # the pieces it is made of — what the cut-protection floor keeps.
+        "voltron_commander_damage": voltron_closer,
+        "voltron_cards": pieces if voltron_closer else [],
+        # A voltron plan with no 21-damage rule: it has to deal the whole life total.
+        "voltron_needs_real_damage": voltron and not game.commander_damage,
+    }
+
+
+def protection(
+    classes: Sequence[CardClass],
+    *,
+    shape: str,
+    deck_size: int,
+    voltron: bool,
+    cal: Calibration = COMMANDER,
+) -> dict:
+    """Protection wants vs the Shape (ADR-0024 advisory). ``voltron`` is the read
+    ``win_conditions`` already made (``wins["voltron"]``) — the one voltron walk."""
+    protecting = [c for c in classes if protects(c.record)]
+    cards = [c.name for c in protecting]
+    wants = shape in ("combo", "control") or voltron
+    target = cal.scaled(cal.protection_target, deck_size) if wants else 0
+    return {
+        "count": _slots(protecting),
+        "cards": cards,
+        "target": target,
+        "wants_protection": wants,
+        "status": "low" if wants and _slots(protecting) < target else "ok",
+    }
+
+
+# ── Commander fit ──────────────────────────────────────────────────────────────
+
+
+def commander_fit(classes: Sequence[CardClass], focus_result: dict) -> dict:
+    commanders = [c for c in classes if c.bucket == "commander"]
+    viable = {a["label"] for a in focus_result["viable_avenues"]}
+    served = {lbl for c in commanders for lbl in c.served}
+    served_viable = sorted(served & viable)
+    fit = round(len(served_viable) / len(viable), 2) if viable else 1.0
+    # Only meaningful once the deck has ≥2 viable avenues; a single-avenue deck can't be
+    # "built for a different commander" on this signal.
+    misfit = len(viable) >= 2 and fit < 0.5
+    return {
+        "fit": fit,
+        "serves_viable": served_viable,
+        "viable_count": len(viable),
+        "misfit": misfit,
+    }

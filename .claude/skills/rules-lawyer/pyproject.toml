@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rules-lawyer"
+version = "0.1.0"
+description = "MTG Comprehensive Rules lookup and per-card rulings fetcher (shared from mtg-utils)"
+requires-python = ">=3.12"
+dependencies = ["click>=8.0", "requests>=2.28"]
+
+[project.scripts]
+# Rules-lawyer-specific entry points
+download-rules = "mtg_utils.download_rules:main"
+rules-lookup = "mtg_utils.rules_lookup:main"
+rulings-lookup = "mtg_utils.rulings_lookup:main"
+
+# Reused from mtg-utils (rules-lawyer commonly uses these for card-name
+# resolution and oracle-text context before looking up rules/rulings).
+card-search = "mtg_utils.card_search:main"
+card-summary = "mtg_utils.card_summary:main"
+download-mtgjson = "mtg_utils.download_mtgjson:main"
+scryfall-lookup = "mtg_utils.scryfall_lookup:main"
+web-fetch = "mtg_utils.web_fetch:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["../tests/rules-lawyer"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    # Pinned exactly, and identically across all nine pyproject.toml files: CI
+    # lints/formats the WHOLE repo with mtg-utils' ruff, so a skill resolving a
+    # different version formats code CI then rejects. `>=` previously let the eight
+    # lockfiles drift across six versions. It also matters that `select = ["ALL"]`
+    # below opts into EVERY rule, so each ruff release auto-enables new ones — the
+    # 0.15 -> 0.16 bump added five (CPY001/RUF036/ISC004/PLR0917/FURB192). An
+    # unpinned resolver bump therefore fails CI with no code change to blame. Bump
+    # deliberately, in all nine at once, and triage the new rules — ignore-list or
+    # fix — in that same commit.
+    "ruff==0.16.2",
+]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D",       # pydocstyle — skip docstring enforcement
+    "ANN",     # flake8-annotations — skip type annotation enforcement
+    "ERA",     # eradicate — skip commented-out code detection
+    "FIX",     # fixme — allow TODO/FIXME comments
+    "TD",      # flake8-todos — skip TODO format enforcement
+    "S",       # bandit — skip security checks (CLI tool, not a service)
+    "INP001",  # implicit-namespace-package
+    "T20",     # flake8-print — CLI tool uses print/click.echo
+    "TRY003",  # long exception messages are fine
+    "EM",      # exception message formatting — overly strict
+    "PLR2004", # magic values
+    "COM812",  # trailing comma — conflicts with formatter
+    "ISC001",  # implicit string concat — conflicts with formatter
+    "C901",    # complexity — Click commands are inherently branchy
+    "PLR0912", # too many branches
+    "PLR0913", # too many arguments — Click commands need many params
+    "PLR0911", # too many return statements — parser helpers are naturally multi-exit
+    "TC",      # type-checking imports
+    "PLC0415", # non-top-level import
+    "ARG002",  # unused method argument — mock patches require positional args
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "SLF001",
+    "E501",
+    "PERF401",
+]
+"../tests/*" = [
+    "SLF001",
+    "E501",
+    "PERF401",
+    "N999",
+]

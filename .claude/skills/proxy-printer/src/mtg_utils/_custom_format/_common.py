@@ -1,0 +1,595 @@
+"""Shared harness for custom-format simulators.
+
+Library-effect classifier, commitment heuristic, pick decision, library-target
+heuristic, per-game state types, simulation loop, cross-game aggregation.
+"""
+
+from __future__ import annotations
+
+import random
+import re
+from collections import defaultdict
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from enum import StrEnum
+from types import ModuleType
+
+from mtg_utils.card_classify import count_color_pips
+from mtg_utils.card_classify import is_land as _is_land
+from mtg_utils.theme_presets import PRESETS
+from mtg_utils.theme_presets import matches as _preset_matches
+
+
+class LibraryEffect(StrEnum):
+    """Coarse category of library-zone interaction (Silver model)."""
+
+    NONE = "none"
+    PEEK = "peek"
+    REORDER = "reorder"
+    DISCARD = "discard"
+    EXILE = "exile"
+    MILL = "mill"
+    SEARCH = "search"
+
+
+# Order matters: more-specific patterns first. Each card classifies to the
+# first category whose pattern matches its oracle text.
+_SEARCH_PATTERN = re.compile(r"\bsearch your library\b", re.IGNORECASE)
+_MILL_PATTERN = re.compile(
+    r"\bmill (a|an|two|three|four|five|six|seven|\d+) cards?\b",
+    re.IGNORECASE,
+)
+_EXILE_TOP_PATTERN = re.compile(
+    r"\bexile (the top|that) card",
+    re.IGNORECASE,
+)
+_SURVEIL_PATTERN = re.compile(
+    r"\bsurveil \d+\b"
+    r"|\bmay put (it|that card) into (your|their|its owner's) graveyard\b",
+    re.IGNORECASE,
+)
+_PEEK_PATTERN = re.compile(
+    r"\b(look at|reveals?) the top( \w+)? cards? of\b",
+    re.IGNORECASE,
+)
+_SCRY_PATTERN = re.compile(r"\bscry \d+\b", re.IGNORECASE)
+
+
+def parse_pip_counts(mana_cost: str) -> dict[str, int]:
+    """Count colored pips per WUBRG color in a Scryfall mana_cost string.
+
+    ``"{2}{U}{U}"`` → ``{"U": 2}``. ``"{X}{X}{B}{B}{B}{B}"`` → ``{"B": 4}``.
+    Pure-generic costs return an empty dict. Hybrid ({U/R}) and Phyrexian ({U/P})
+    pips are NOT counted as colored. Thin wrapper over the shared
+    ``card_classify.count_color_pips``.
+    """
+    return count_color_pips(mana_cost)
+
+
+def classify_library_effect(card: dict) -> LibraryEffect:
+    """Map a card's oracle text to a library-effect category.
+
+    Order of checks matters — more-specific effects are caught before more-
+    generic ones (e.g., 'mill' is checked before 'reveal the top').
+    """
+    text = card.get("oracle_text") or ""
+    if not text:
+        return LibraryEffect.NONE
+
+    if _SEARCH_PATTERN.search(text):
+        return LibraryEffect.SEARCH
+    if _MILL_PATTERN.search(text):
+        return LibraryEffect.MILL
+    if _EXILE_TOP_PATTERN.search(text):
+        return LibraryEffect.EXILE
+    if _SURVEIL_PATTERN.search(text):
+        return LibraryEffect.DISCARD
+    if _SCRY_PATTERN.search(text):
+        return LibraryEffect.REORDER
+    if _PEEK_PATTERN.search(text):
+        return LibraryEffect.PEEK
+    return LibraryEffect.NONE
+
+
+@dataclass(frozen=True)
+class CardMetadata:
+    """Per-card precomputed data used by every simulation step."""
+
+    name: str
+    cmc: int
+    color_identity: frozenset[str]
+    produced_mana: tuple[str, ...]
+    is_land: bool
+    library_effect: LibraryEffect
+    archetype_matches: frozenset[str]
+    # Sorted ((color, count), ...) of colored pips parsed from mana_cost.
+    # E.g., Counterspell {U}{U} → (("U", 2),); generic-only or land → ().
+    pip_counts: tuple[tuple[str, int], ...] = ()
+
+
+def precompute_metadata(
+    hydrated: list[dict],
+    *,
+    presets: list[str],
+) -> list[CardMetadata]:
+    """Pre-classify each card once at simulator init.
+
+    Validates preset names against the library; unknown preset raises KeyError.
+    """
+    for name in presets:
+        if name not in PRESETS:
+            raise KeyError(f"Unknown preset: {name!r}")
+
+    out: list[CardMetadata] = []
+    for card in hydrated:
+        archetype_set = frozenset(p for p in presets if _preset_matches(p, card))
+        pip_counts = tuple(
+            sorted(
+                parse_pip_counts(card.get("mana_cost") or "").items(),
+            )
+        )
+        out.append(
+            CardMetadata(
+                name=card.get("name", ""),
+                cmc=int(card.get("cmc") or 0),
+                color_identity=frozenset(card.get("color_identity") or []),
+                produced_mana=tuple(card.get("produced_mana") or []),
+                is_land=_is_land(card),
+                library_effect=classify_library_effect(card),
+                archetype_matches=archetype_set,
+                pip_counts=pip_counts,
+            )
+        )
+    return out
+
+
+def can_cast_with_pips(
+    card: CardMetadata,
+    mana_pool: dict[str, int],
+) -> bool:
+    """Return True if ``card`` can be cast given a per-color mana pool.
+
+    Pip-aware: requires sufficient mana of each colored pip in the cost.
+    Generic mana is paid from any remaining mana of any color.
+
+    Lands always return False (they're not cast). Cards with no colored
+    pips (artifacts, generic costs) need only ``cmc`` mana of any color.
+    """
+    if card.is_land:
+        return False
+    pool = dict(mana_pool)
+    used_colored = 0
+    for color, count in card.pip_counts:
+        available = pool.get(color, 0)
+        if available < count:
+            return False
+        pool[color] -= count
+        used_colored += count
+    needed_generic = max(0, card.cmc - used_colored)
+    return sum(pool.values()) >= needed_generic
+
+
+COMMITMENT_MIN_COUNT = 2
+COMMITMENT_THRESHOLD = 0.4
+
+
+def commitment_check(
+    pile_archetype_counts: dict[str, int],
+    *,
+    pile_size: int,
+    min_count: int = COMMITMENT_MIN_COUNT,
+    threshold: float = COMMITMENT_THRESHOLD,
+) -> str | None:
+    """Return the archetype to commit to, or None if no archetype qualifies.
+
+    An archetype qualifies iff it has ``>= min_count`` cards in the pile AND
+    ``>= threshold`` fraction of pile_size. Among qualifiers, return the one
+    with the highest count. Ties broken alphabetically for determinism.
+    """
+    if pile_size == 0 or not pile_archetype_counts:
+        return None
+
+    qualifiers: list[tuple[str, int]] = []
+    for archetype, count in pile_archetype_counts.items():
+        if count < min_count:
+            continue
+        if count / pile_size < threshold:
+            continue
+        qualifiers.append((archetype, count))
+
+    if not qualifiers:
+        return None
+
+    qualifiers.sort(key=lambda kv: (-kv[1], kv[0]))
+    return qualifiers[0][0]
+
+
+@dataclass(frozen=True)
+class PickDecision:
+    """Outcome of a draw step's pick decision.
+
+    ``kind`` is ``"marketplace"`` or ``"blind"``. When ``"marketplace"``,
+    ``card_index`` is the position in the marketplace list to take. When
+    ``"blind"``, ``card_index`` is None.
+    """
+
+    kind: str
+    card_index: int | None = None
+
+
+def _can_cast(
+    card: CardMetadata,
+    *,
+    available_mana: int,
+    available_colors: frozenset[str],
+) -> bool:
+    """Castable iff (a) on-color and (b) CMC fits available mana."""
+    if card.is_land:
+        return False
+    if not card.color_identity.issubset(available_colors):
+        return False
+    return card.cmc <= available_mana
+
+
+def _best_castable(
+    marketplace: list[CardMetadata],
+    *,
+    available_mana: int,
+    available_colors: frozenset[str],
+) -> int | None:
+    """Return index of highest-CMC castable card; None if nothing castable."""
+    best_idx: int | None = None
+    best_cmc = -1
+    for idx, card in enumerate(marketplace):
+        if not _can_cast(
+            card, available_mana=available_mana, available_colors=available_colors
+        ):
+            continue
+        if card.cmc > best_cmc:
+            best_cmc = card.cmc
+            best_idx = idx
+    return best_idx
+
+
+def _best_archetype_match(
+    marketplace: list[CardMetadata],
+    *,
+    archetype: str,
+) -> int | None:
+    """Return index of highest-CMC card matching the archetype; None if none."""
+    best_idx: int | None = None
+    best_cmc = -1
+    for idx, card in enumerate(marketplace):
+        if archetype not in card.archetype_matches:
+            continue
+        if card.cmc > best_cmc:
+            best_cmc = card.cmc
+            best_idx = idx
+    return best_idx
+
+
+class Zone(StrEnum):
+    """Library zone for library-effect targeting."""
+
+    MARKETPLACE = "marketplace"
+    DRAW_PILE = "draw_pile"
+
+
+# CMC threshold above which a marketplace card is "high-value" — denial worth it.
+DENIAL_HIGH_CMC = 4
+
+
+def choose_library_target(
+    effect: LibraryEffect,
+    *,
+    marketplace: list[CardMetadata],
+) -> Zone:
+    """Pick which zone a library-effect targets.
+
+    PEEK / REORDER / MILL → draw pile (marketplace is already face-up).
+    DISCARD / EXILE → marketplace iff it has a high-CMC nonland playable;
+                       else draw pile (cycling).
+    SEARCH → draw pile (format-disallowed but answer must be deterministic).
+    """
+    if effect in (
+        LibraryEffect.PEEK,
+        LibraryEffect.REORDER,
+        LibraryEffect.MILL,
+        LibraryEffect.SEARCH,
+        LibraryEffect.NONE,
+    ):
+        return Zone.DRAW_PILE
+
+    # DISCARD or EXILE — denial-aware
+    has_high_value = any(
+        (not c.is_land) and c.cmc >= DENIAL_HIGH_CMC for c in marketplace
+    )
+    return Zone.MARKETPLACE if has_high_value else Zone.DRAW_PILE
+
+
+def choose_pick(
+    marketplace: list[CardMetadata],
+    *,
+    committed: str | None,
+    available_mana: int,
+    available_colors: frozenset[str],
+) -> PickDecision:
+    """Decide whether to pick from marketplace and which card.
+
+    - Committed: prefer an archetype-matching card (regardless of immediate
+      playability). Soft fallback to greedy CMC if no match.
+    - Uncommitted: greedy — highest-CMC playable on available colors.
+    - If marketplace is empty or nothing is pickable, return blind-draw.
+    """
+    if not marketplace:
+        return PickDecision(kind="blind")
+
+    avail_colors = frozenset(available_colors)
+
+    if committed is not None:
+        match_idx = _best_archetype_match(marketplace, archetype=committed)
+        if match_idx is not None:
+            return PickDecision(kind="marketplace", card_index=match_idx)
+        # Soft fallback to greedy.
+
+    greedy_idx = _best_castable(
+        marketplace,
+        available_mana=available_mana,
+        available_colors=avail_colors,
+    )
+    if greedy_idx is None:
+        return PickDecision(kind="blind")
+    return PickDecision(kind="marketplace", card_index=greedy_idx)
+
+
+@dataclass
+class Player:
+    """One player's mutable state during a game."""
+
+    seat: int
+    hand: list[int] = field(default_factory=list)  # card indices
+    battlefield: list[int] = field(default_factory=list)
+    graveyard: list[int] = field(default_factory=list)
+    lands_in_play: list[int] = field(default_factory=list)
+    pile_archetype_counts: dict[str, int] = field(
+        default_factory=lambda: defaultdict(int)
+    )
+    pile_size: int = 0
+    committed_archetype: str | None = None
+
+    def known_colors(self, metadata: list[CardMetadata]) -> frozenset[str]:
+        """Union of color identities of all cards in hand/battlefield/lands."""
+        cards = self.hand + self.battlefield + self.lands_in_play
+        seen: set[str] = set()
+        for idx in cards:
+            seen |= metadata[idx].color_identity
+        return frozenset(seen)
+
+
+@dataclass
+class PerGameMetrics:
+    """Per-game telemetry collected during simulation."""
+
+    lands_in_play_by_turn: list[dict[int, int]] = field(default_factory=list)
+    mana_available_by_turn: list[dict[int, int]] = field(default_factory=list)
+    times_color_screwed: list[int] = field(default_factory=list)
+    marketplace_picks: list[int] = field(default_factory=list)
+    blind_draws: list[int] = field(default_factory=list)
+    library_effects_cast: list[int] = field(default_factory=list)
+    pile_archetype_counts: list[dict[str, int]] = field(default_factory=list)
+    committed_archetype: list[str | None] = field(default_factory=list)
+    first_enabler_turn: list[dict[str, int]] = field(default_factory=list)
+
+    marketplace_cards_exiled: int = 0
+    marketplace_cards_discarded: int = 0
+    cards_milled: int = 0
+
+
+@dataclass
+class GameState:
+    """Full state of one in-progress game."""
+
+    library: list[int] = field(default_factory=list)
+    marketplace: list[int] = field(default_factory=list)
+    exile: list[int] = field(default_factory=list)
+    graveyard: list[int] = field(default_factory=list)
+    players: list[Player] = field(default_factory=list)
+    active_seat: int = 0
+    turn: int = 1
+    metrics: PerGameMetrics = field(default_factory=PerGameMetrics)
+
+
+def lookup_card(
+    idx: int,
+    *,
+    cube_metadata: list[CardMetadata],
+    basic_metadata: Sequence[CardMetadata],
+) -> CardMetadata:
+    """Resolve a combined card index → metadata.
+
+    Indices 0..len(basic_metadata)-1 are basics; the rest are cube cards.
+    """
+    n_basics = len(basic_metadata)
+    if idx < n_basics:
+        return basic_metadata[idx]
+    return cube_metadata[idx - n_basics]
+
+
+def simulate_one_game(
+    format_module: ModuleType,
+    *,
+    cube_metadata: list[CardMetadata],
+    basic_metadata: Sequence[CardMetadata],
+    rng: random.Random,
+    n_players: int,
+    max_turns: int,
+) -> PerGameMetrics:
+    """Run one game; return its metrics."""
+    state = format_module.setup(
+        cube_metadata=cube_metadata,
+        basic_metadata=basic_metadata,
+        rng=rng,
+        n_players=n_players,
+    )
+    while not format_module.is_terminal(state, max_turns=max_turns):
+        format_module.run_turn(
+            state,
+            cube_metadata=cube_metadata,
+            basic_metadata=basic_metadata,
+            rng=rng,
+        )
+    # Snapshot final per-player pile counts (arrays were pre-sized in setup()).
+    for seat, player in enumerate(state.players):
+        state.metrics.pile_archetype_counts[seat] = dict(
+            player.pile_archetype_counts,
+        )
+        state.metrics.committed_archetype[seat] = player.committed_archetype
+    return state.metrics
+
+
+def run_simulation(
+    format_module: ModuleType,
+    *,
+    cube_metadata: list[CardMetadata],
+    basic_metadata: Sequence[CardMetadata],
+    archetype_names: list[str],
+    n_players: int,
+    max_turns: int,
+    n_games: int,
+    base_seed: int,
+) -> dict:
+    """Run N games and aggregate metrics; returns the envelope.results dict."""
+    per_game: list[PerGameMetrics] = []
+    for game_idx in range(n_games):
+        rng = random.Random(base_seed + game_idx)
+        per_game.append(
+            simulate_one_game(
+                format_module,
+                cube_metadata=cube_metadata,
+                basic_metadata=basic_metadata,
+                rng=rng,
+                n_players=n_players,
+                max_turns=max_turns,
+            )
+        )
+    return aggregate_runs(
+        per_game, archetype_names=archetype_names, max_turns=max_turns
+    )
+
+
+ASSEMBLY_THRESHOLD = 4  # K from spec section 5: pile must contain >=K archetype cards.
+
+
+def aggregate_runs(
+    per_game: list[PerGameMetrics],
+    *,
+    archetype_names: list[str],
+    max_turns: int,  # noqa: ARG001 - reserved for per-turn bucketing
+) -> dict:
+    """Aggregate per-game metrics into rates and means."""
+    n_games = len(per_game)
+    if n_games == 0:
+        return {
+            "per_archetype": {
+                a: {"assembly_rate": 0.0, "mean_first_enabler_turn": None}
+                for a in archetype_names
+            },
+            "marketplace_dynamics": {
+                "utilization_rate": 0.0,
+                "library_effects_per_turn": 0.0,
+                "exiled_per_game": 0.0,
+                "discarded_per_game": 0.0,
+                "milled_per_game": 0.0,
+            },
+            "per_player_mana": {
+                "reaches_4_mana_by_t4": 0.0,
+                "color_screw_rate": 0.0,
+                "mean_turns_to_first_enabler": None,
+            },
+            "n_games": 0,
+        }
+
+    # Per-archetype assembly: any seat with pile_archetype_counts[a] >= K.
+    per_archetype: dict[str, dict] = {}
+    for a in archetype_names:
+        assembled_games = 0
+        assembly_turns: list[int] = []
+        for g in per_game:
+            for seat, pile in enumerate(g.pile_archetype_counts):
+                if pile.get(a, 0) >= ASSEMBLY_THRESHOLD:
+                    assembled_games += 1
+                    # Per-seat first-enabler turn is the proxy for assembly time.
+                    n_fe = len(g.first_enabler_turn)
+                    fe = g.first_enabler_turn[seat] if seat < n_fe else {}
+                    if a in fe:
+                        assembly_turns.append(fe[a])
+                    break  # one seat per game suffices
+        per_archetype[a] = {
+            "assembly_rate": assembled_games / n_games,
+            "mean_first_enabler_turn": (
+                sum(assembly_turns) / len(assembly_turns) if assembly_turns else None
+            ),
+        }
+
+    # Marketplace dynamics — sum across players within a game, then average.
+    total_picks = sum(sum(g.marketplace_picks) for g in per_game)
+    total_draws = sum(sum(g.blind_draws) for g in per_game)
+    total_attempts = total_picks + total_draws
+    util = total_picks / total_attempts if total_attempts else 0.0
+
+    total_lib_casts = sum(sum(g.library_effects_cast) for g in per_game)
+    # Total turns across all players x games:
+    total_turns_player_units = sum(
+        sum(len(d) for d in g.lands_in_play_by_turn) for g in per_game
+    )
+    lib_per_turn = (
+        total_lib_casts / total_turns_player_units if total_turns_player_units else 0.0
+    )
+
+    exiled_per_game = sum(g.marketplace_cards_exiled for g in per_game) / n_games
+    discarded_per_game = sum(g.marketplace_cards_discarded for g in per_game) / n_games
+    milled_per_game = sum(g.cards_milled for g in per_game) / n_games
+
+    # Per-player mana
+    reaches_4_count = 0
+    reaches_4_total = 0
+    for g in per_game:
+        for seat_lands in g.lands_in_play_by_turn:
+            reaches_4_total += 1
+            if seat_lands.get(4, 0) >= 4:
+                reaches_4_count += 1
+    reaches_4_rate = reaches_4_count / reaches_4_total if reaches_4_total else 0.0
+
+    color_screw_count = sum(sum(g.times_color_screwed) for g in per_game)
+    color_screw_rate = (
+        color_screw_count / total_turns_player_units
+        if total_turns_player_units
+        else 0.0
+    )
+
+    enabler_turns: list[int] = [
+        t
+        for g in per_game
+        for seat_fe in g.first_enabler_turn
+        for t in seat_fe.values()
+    ]
+    mean_first_enabler = (
+        sum(enabler_turns) / len(enabler_turns) if enabler_turns else None
+    )
+
+    return {
+        "per_archetype": per_archetype,
+        "marketplace_dynamics": {
+            "utilization_rate": util,
+            "library_effects_per_turn": lib_per_turn,
+            "exiled_per_game": exiled_per_game,
+            "discarded_per_game": discarded_per_game,
+            "milled_per_game": milled_per_game,
+        },
+        "per_player_mana": {
+            "reaches_4_mana_by_t4": reaches_4_rate,
+            "color_screw_rate": color_screw_rate,
+            "mean_turns_to_first_enabler": mean_first_enabler,
+        },
+        "n_games": n_games,
+    }

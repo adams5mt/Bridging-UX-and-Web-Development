@@ -1,0 +1,433 @@
+# Committed offline/CI fallback for phase's known-tokens.toml (task #92,
+# widened task #95, again task #np_roles; regenerated at the v0.35.2 pin
+# bump, 2026-07-24; re-verified byte-identical at the v0.45.0 pin bump,
+# 2026-08-04, and again at the v0.66.0 pin bump, 2026-08-29).
+#
+# mtg_utils._card_ir.trees._known_tokens_index() prefers the LIVE
+# tag-pinned known-tokens.toml (_phase.ensure_known_tokens() — since phase
+# v0.32.0 a ~2860-entry MTGJSON-derived canonical catalog, cached under
+# ~/.cache/mtg-skills/phase/known-tokens/) when it can be fetched/read.
+# This file is the deterministic fallback for when it can't (no network,
+# cold cache, CI) — carrying EVERY catalog entry whose display_name the
+# adjudicated allowlist (_KNOWN_TOKEN_WIRED_DISPLAY_NAMES: Mutagen,
+# Young Hero, Powerstone, Lander, Gold, Map, Junk, Wicked, and the
+# task #np_roles seven — Cursed, Royal, Sorcerer, Shard, Wizard, Contract,
+# Spellgorger Weird) wires, trimmed to the fields the join reads
+# (id / rules_text / token.body) and dropping the upstream entry's large
+# source_card_names / source_card_refs / token_image_ref arrays
+# (informational there, unread here). ALL same-name variant ids are
+# carried (the v0.32.0 catalog splits printings into id-keyed variants —
+# e.g. 7 Wizard identities, 8 Golds; a card's own related_token_ids picks
+# the right variant, and the card's own Token-node name + no-parsed-
+# abilities gap gate in _known_token_trees still applies), so the
+# id-keyed join stays byte-for-byte deterministic offline vs live.
+#
+# Extracted verbatim from phase v0.35.2's known-tokens.toml (all 38 wired
+# entries unchanged in v0.45.0's and v0.66.0's). If the wired
+# allowlist ever widens, regenerate this file (the bump-session script in
+# git history) so CI / offline dev stays deterministic regardless of who
+# has a live fetch.
+
+
+[[token]]
+id = "01c5a18f-07e6-593c-bc90-0683505ea03f"
+rules_text = "{1}, {T}, Sacrifice this token: Put a +1/+1 counter on target creature. Activate only as a sorcery."
+
+[token.body]
+display_name = "Mutagen"
+core_types = ["Artifact"]
+subtypes = ["Mutagen"]
+supertypes = []
+
+[[token]]
+id = "1498b1ca-31fb-50bd-b106-b9298eaece80"
+rules_text = """
+Enchant creature
+Enchanted creature has "Whenever this creature attacks, if its toughness is 3 or less, put a +1/+1 counter on it.""""
+
+[token.body]
+display_name = "Young Hero"
+core_types = ["Enchantment"]
+subtypes = ["Aura", "Role"]
+supertypes = []
+
+[[token]]
+id = "af8db311-3520-5cf7-8410-7390c29da873"
+rules_text = "{T}: Add {C}. This mana can't be spent to cast a nonartifact spell."
+
+[token.body]
+display_name = "Powerstone"
+core_types = ["Artifact"]
+subtypes = ["Powerstone"]
+supertypes = []
+
+[[token]]
+id = "f1369647-2863-5cc6-91b4-00d9c735e19e"
+rules_text = "{T}: Add {C}. This mana can't be spent to cast a nonartifact spell."
+
+[token.body]
+display_name = "Powerstone"
+core_types = ["Artifact"]
+subtypes = ["Powerstone"]
+supertypes = []
+
+[[token]]
+id = "7b3e5486-632b-5245-8026-3222282173bc"
+rules_text = "{2}, {T}, Sacrifice this token: Search your library for a basic land card, put it onto the battlefield tapped, then shuffle."
+
+[token.body]
+display_name = "Lander"
+core_types = ["Artifact"]
+subtypes = ["Lander"]
+supertypes = []
+
+[[token]]
+id = "aa102a33-13dd-5fe8-99ee-2009cef90851"
+rules_text = "{2}, {T}, Sacrifice this token: Search your library for a basic land card, put it onto the battlefield tapped, then shuffle."
+
+[token.body]
+display_name = "Lander"
+core_types = ["Artifact"]
+subtypes = ["Lander"]
+supertypes = []
+
+[[token]]
+id = "b754db78-cd98-5f25-84f4-0367b66da7ed"
+rules_text = "{2}, {T}, Sacrifice this token: Search your library for a basic land card, put it onto the battlefield tapped, then shuffle."
+
+[token.body]
+display_name = "Lander"
+core_types = ["Artifact"]
+subtypes = ["Lander"]
+supertypes = []
+
+[[token]]
+id = "c9ce4bf6-d5b9-58f6-9fdf-5066bb2bb950"
+rules_text = "{2}, {T}, Sacrifice this token: Search your library for a basic land card, put it onto the battlefield tapped, then shuffle."
+
+[token.body]
+display_name = "Lander"
+core_types = ["Artifact"]
+subtypes = ["Lander"]
+supertypes = []
+
+[[token]]
+id = "f59d0a48-ea2e-5c2f-ada8-e045fa140c1b"
+rules_text = "{2}, {T}, Sacrifice this token: Search your library for a basic land card, put it onto the battlefield tapped, then shuffle."
+
+[token.body]
+display_name = "Lander"
+core_types = ["Artifact"]
+subtypes = ["Lander"]
+supertypes = []
+
+[[token]]
+id = "214f0959-71fa-59ba-8efb-080cbc3e5b99"
+rules_text = "Sacrifice this token: Add one mana of any color."
+
+[token.body]
+display_name = "Gold"
+core_types = ["Artifact"]
+subtypes = ["Gold"]
+supertypes = []
+
+[[token]]
+id = "22a28f99-386e-5b4c-98b1-ce589600b6c9"
+rules_text = "Sacrifice this token: Add one mana of any color."
+
+[token.body]
+display_name = "Gold"
+core_types = ["Artifact"]
+subtypes = ["Gold"]
+supertypes = []
+
+[[token]]
+id = "603d6f2b-313f-5453-a3f1-55f5154ec9f6"
+rules_text = "Sacrifice this token: Add one mana of any color."
+
+[token.body]
+display_name = "Gold"
+core_types = ["Artifact"]
+subtypes = ["Gold"]
+supertypes = []
+
+[[token]]
+id = "66cd1235-f092-5483-b517-bd0398621a94"
+rules_text = "Sacrifice this token: Add one mana of any color."
+
+[token.body]
+display_name = "Gold"
+core_types = ["Artifact"]
+subtypes = ["Gold"]
+supertypes = []
+
+[[token]]
+id = "6c3f3f0f-cfa8-5ae3-ac32-eadcaf33f275"
+rules_text = "Sacrifice this token: Add one mana of any color."
+
+[token.body]
+display_name = "Gold"
+core_types = ["Artifact"]
+subtypes = ["Gold"]
+supertypes = []
+
+[[token]]
+id = "6c4de848-5258-50e6-9a57-ceccc81aefce"
+rules_text = "Sacrifice this token: Add one mana of any color."
+
+[token.body]
+display_name = "Gold"
+core_types = ["Artifact"]
+subtypes = ["Gold"]
+supertypes = []
+
+[[token]]
+id = "a3d5d5c7-2133-5762-a108-aa4de8c98b17"
+rules_text = "Sacrifice this token: Add one mana of any color."
+
+[token.body]
+display_name = "Gold"
+core_types = ["Artifact"]
+subtypes = ["Gold"]
+supertypes = []
+
+[[token]]
+id = "ecdcdb66-d39d-5491-a127-238ff8ec1236"
+rules_text = "Sacrifice this token: Add one mana of any color."
+
+[token.body]
+display_name = "Gold"
+core_types = ["Artifact"]
+subtypes = ["Gold"]
+supertypes = []
+
+[[token]]
+id = "ca9e0bcd-65f0-57dd-b5a1-eb8dac469f15"
+rules_text = "{1}, {T}, Sacrifice this artifact: Target creature you control explores. Activate only as a sorcery. (Reveal the top card of your library. Put that card into your hand if it's a land. Otherwise, put a +1/+1 counter on that creature, then put the card back or put it into your graveyard.)"
+
+[token.body]
+display_name = "Map"
+core_types = ["Artifact"]
+subtypes = ["Map"]
+supertypes = []
+
+[[token]]
+id = "cd91506e-6a64-5e5c-948e-851ed31ac543"
+rules_text = "{1}, {T}, Sacrifice this artifact: Target creature you control explores. Activate only as a sorcery. (Reveal the top card of your library. Put that card into your hand if it's a land. Otherwise, put a +1/+1 counter on that creature, then put the card back or put it into your graveyard.)"
+
+[token.body]
+display_name = "Map"
+core_types = ["Artifact"]
+subtypes = ["Map"]
+supertypes = []
+
+[[token]]
+id = "de557c08-4418-5956-8a9c-1a485cde1194"
+rules_text = "{T}, Sacrifice this artifact: Exile the top card of your library. You may play that card this turn. Activate only as a sorcery."
+
+[token.body]
+display_name = "Junk"
+core_types = ["Artifact"]
+subtypes = ["Junk"]
+supertypes = []
+
+[[token]]
+id = "ab887c26-ecfd-55b4-972a-7518d1e406b6"
+rules_text = """
+Enchant creature
+Enchanted creature gets +1/+1.
+When this Aura is put into a graveyard from the battlefield, each opponent loses 1 life."""
+
+[token.body]
+display_name = "Wicked"
+core_types = ["Enchantment"]
+subtypes = ["Aura", "Role"]
+supertypes = []
+
+[[token]]
+id = "be188b68-76b3-5695-88ae-97d7383f3679"
+rules_text = """
+Enchant creature
+Enchanted creature gets +1/+1.
+When this Aura is put into a graveyard from the battlefield, each opponent loses 1 life."""
+
+[token.body]
+display_name = "Wicked"
+core_types = ["Enchantment"]
+subtypes = ["Aura", "Role"]
+supertypes = []
+
+[[token]]
+id = "a8e38737-ad9f-538b-a910-3dbdea354ade"
+rules_text = """
+Enchant creature
+Enchanted creature has base power and toughness 1/1."""
+
+[token.body]
+display_name = "Cursed"
+core_types = ["Enchantment"]
+subtypes = ["Aura", "Role"]
+supertypes = []
+
+[[token]]
+id = "ef34f7f4-baa6-5209-b6d2-c5e124a2997f"
+rules_text = """
+Enchant creature
+Enchanted creature has base power and toughness 1/1."""
+
+[token.body]
+display_name = "Cursed"
+core_types = ["Enchantment"]
+subtypes = ["Aura", "Role"]
+supertypes = []
+
+[[token]]
+id = "48b5010a-9c00-5cc1-b5e1-f407670846ba"
+rules_text = """
+Enchant creature
+Enchanted creature gets +1/+1 and has ward {1}.
+(Whenever this creature becomes the target of a spell or ability an opponent controls, counter it unless that player pays {1}.)"""
+
+[token.body]
+display_name = "Royal"
+core_types = ["Enchantment"]
+subtypes = ["Aura", "Role"]
+supertypes = []
+
+[[token]]
+id = "4c23fc6d-6c85-5c7b-9176-eeee951c3b31"
+rules_text = """
+Enchant creature
+Enchanted creature gets +1/+1 and has ward {1}. (Whenever this creature becomes the target of a spell or ability an opponent controls, counter it unless that player pays {1}.)"""
+
+[token.body]
+display_name = "Royal"
+core_types = ["Enchantment"]
+subtypes = ["Aura", "Role"]
+supertypes = []
+
+[[token]]
+id = "dd6f5274-9bb4-5acc-9855-55815f497831"
+rules_text = """
+Enchant creature
+Enchanted creature gets +1/+1 and has "Whenever this creature attacks, scry 1.""""
+
+[token.body]
+display_name = "Sorcerer"
+core_types = ["Enchantment"]
+subtypes = ["Aura", "Role"]
+supertypes = []
+
+[[token]]
+id = "2310bee9-2b1f-58ea-b586-707024457259"
+rules_text = "{2}, Sacrifice this enchantment: Scry 1, then draw a card."
+
+[token.body]
+display_name = "Shard"
+core_types = ["Enchantment"]
+subtypes = ["Shard"]
+supertypes = []
+
+[[token]]
+id = "872a2f10-d48f-541d-a27b-a8f3ae7bb23c"
+rules_text = "{2}, Sacrifice this enchantment: Scry 1, then draw a card."
+
+[token.body]
+display_name = "Shard"
+core_types = ["Enchantment"]
+subtypes = ["Shard"]
+supertypes = []
+
+[[token]]
+id = "04a068bc-ff53-5736-9819-67f29d4e2bce"
+rules_text = "{1}, Sacrifice this creature: Counter target noncreature spell unless its controller pays {1}."
+
+[token.body]
+display_name = "Wizard"
+core_types = ["Creature"]
+subtypes = ["Wizard"]
+supertypes = []
+
+[[token]]
+id = "3cf5972f-8201-53a4-a77e-05a0951a0d96"
+rules_text = "{T}: Add {R}. Spend this mana only to cast a planeswalker spell."
+
+[token.body]
+display_name = "Wizard"
+core_types = ["Creature"]
+subtypes = ["Wizard"]
+supertypes = []
+
+[[token]]
+id = "5d28e979-a264-59a8-8b04-fd3636ccfeb7"
+rules_text = "Whenever you cast a noncreature spell, this token deals 1 damage to each opponent."
+
+[token.body]
+display_name = "Wizard"
+core_types = ["Creature"]
+subtypes = ["Wizard"]
+supertypes = []
+
+[[token]]
+id = "9b47488c-320d-5b91-b7be-fd6a32c343a2"
+rules_text = ""
+
+[token.body]
+display_name = "Wizard"
+core_types = ["Creature"]
+subtypes = ["Wizard"]
+supertypes = []
+
+[[token]]
+id = "c510f2dd-8d22-5882-b4df-6ccb807b39d6"
+rules_text = "{1}, Sacrifice this creature: Counter target noncreature spell unless its controller pays {1}."
+
+[token.body]
+display_name = "Wizard"
+core_types = ["Creature"]
+subtypes = ["Wizard"]
+supertypes = []
+
+[[token]]
+id = "c6009a9d-3584-5b6f-88e6-1678449bc0e6"
+rules_text = "Whenever you cast a noncreature spell, this token deals 1 damage to each opponent."
+
+[token.body]
+display_name = "Wizard"
+core_types = ["Creature"]
+subtypes = ["Wizard"]
+supertypes = []
+
+[[token]]
+id = "f0b41b8f-465c-581c-b8d6-f62d42417162"
+rules_text = "Whenever you cast a noncreature spell, this token deals 1 damage to each opponent."
+
+[token.body]
+display_name = "Wizard"
+core_types = ["Creature"]
+subtypes = ["Wizard"]
+supertypes = []
+
+[[token]]
+id = "9e126926-0331-57c4-9316-4da332ae99f2"
+rules_text = """
+Enchant creature
+Whenever enchanted creature attacks, it gets +2/+0 until end of turn if it's attacking one of your opponents. Otherwise, its controller loses 2 life."""
+
+[token.body]
+display_name = "Contract"
+core_types = ["Enchantment"]
+subtypes = ["Aura"]
+supertypes = []
+
+[[token]]
+id = "b1ada3a2-f010-583d-85f8-6d7d496a70a2"
+rules_text = """
+Whenever you cast a noncreature spell, put a +1/+1 counter on this creature.
+(This token's mana cost is {2}{R}.)"""
+
+[token.body]
+display_name = "Spellgorger Weird"
+core_types = ["Creature"]
+subtypes = ["Weird"]
+supertypes = []

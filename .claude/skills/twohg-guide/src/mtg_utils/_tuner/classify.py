@@ -1,0 +1,210 @@
+"""Per-card Spine / Engine / Filler classification (the tuner's shared substrate).
+
+The tri-partition (deck-forge CONTEXT.md): every nonland, non-commander card is
+**Spine** (mandatory scaffolding — ramp / draw / interaction / wipes), **Engine**
+(serves an avenue), or **Filler** (serves no avenue here). Lands and commanders are
+their own buckets. No new matchers: Spine roles come from ``roles.role_of`` and
+avenue-serving from ``ranking.score_candidate``/``serves`` — both bottoming out in
+``theme_presets`` (ADR-0023).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from mtg_utils._analysis.costs import effective_mana_value
+from mtg_utils._analysis.ranking import score_candidate
+from mtg_utils._analysis.roles import DeckMana, protects, role_of
+from mtg_utils._arena_meta.meta import CUT_SHARE
+from mtg_utils.card_classify import is_land
+from mtg_utils.formats import medium_is_digital
+from mtg_utils.hydrated_deck import HydratedDeck
+
+if TYPE_CHECKING:
+    from mtg_utils._arena_meta.meta import MetaContext
+
+# The hard-counted Spine roles; ``lands`` is its own bucket (the curve gate's domain).
+_SPINE_ROLES = frozenset({"ramp", "card_draw", "interaction", "board_wipe"})
+
+# Card-quality signal (the ONE place the tuner leans on EDHREC popularity, by explicit
+# user direction — ADR-0009 still bars it from the Find ranker). Scryfall's edhrec_rank
+# is a global play-rate rank (lower = more played); absent ≈ unplayed. A card
+# ranked worse than this floor in a themed deck is "fringe": it nominally feeds a broad
+# avenue but almost nobody runs it, so it's an upgrade target. Calibrated against the
+# benchmark — vanilla beaters sit >23k/None while real theme cards are <8k.
+FRINGE_RANK = 15000
+
+
+def is_fringe(rank: int | None, *, medium: str = "paper") -> bool:
+    """True when a card is barely-played (an upgrade candidate within its theme).
+
+    EDHREC is a paper-EDH population (ADR-0040 §4): a null rank on a digital
+    deck is a population artifact (Arena-only cards can never appear there) —
+    no data, never condemning. On paper, absence genuinely means unplayed."""
+    if rank is None:
+        return not medium_is_digital(medium)
+    return rank > FRINGE_RANK
+
+
+@dataclass(frozen=True)
+class CardClass:
+    """One deck card's classification, used by every downstream metric."""
+
+    name: str
+    bucket: str  # "commander" | "land" | "spine" | "engine" | "filler"
+    roles: tuple[str, ...]  # template roles filled (sorted)
+    served: tuple[str, ...]  # avenue labels this card serves (deduped)
+    dual_purpose: bool  # Spine AND serves an avenue (a "win-win" card)
+    # The mana the deck pays to cast it on curve: printed mana value, or a cheaper
+    # unconditional alternative cost (``_analysis.costs.effective_mana_value``: warp,
+    # evoke…).
+    cmc: float
+    record: dict
+    edhrec_rank: int | None = None  # play-rate rank; lower=more played, None=unplayed
+    # Copies of the card in the counted zones (1 in a singleton deck; up to the copy
+    # limit in a 4-of one). Every slot count sums it; name lists stay per name.
+    quantity: int = 1
+    # ADR-0040 §2 (task #97): the card's Granter grade ("premium"/"solid"/
+    # "weak" via the ability-quality table; None = not a Granter). The
+    # low-value reads condemn a Granter by GRADE, never by playrate.
+    grant_grade: str | None = None
+    # ADR-0040 §5 (task #100): grants a closer-grade ability (team double
+    # strike) — ONE closer regardless of recipient count.
+    grant_closer: bool = False
+    # ADR-0059: the share of the deck's meta archetype's ladder lists that run the
+    # card (None = no meta read). Where set it replaces EDHREC play rate: a digital
+    # deck's population is the Arena ladder it plays against, not paper EDH.
+    meta_share: float | None = None
+
+    def low_value(self, *, medium: str = "paper", playrate: bool = True) -> bool:
+        """An Engine card that feeds a theme but isn't pulling its weight — dead weight
+        the bucket test alone misses, and an upgrade target. A Granter is condemned by
+        granted-ability QUALITY alone (ADR-0040 §2: a weak grade — Enduring Sliver's
+        outlast), never by play-rate; a non-Granter by a fringe play-rate (the one
+        EDHREC-popularity lean, by user direction; medium-aware per §4) — and only
+        where play-rate means something (``playrate``: a paper-EDH population says
+        nothing about a Modern card). Where the deck has a meta archetype (ADR-0059),
+        a card almost none of its ladder lists run is low-value instead."""
+        if self.bucket != "engine":
+            return False
+        if self.grant_grade is not None:
+            return self.grant_grade == "weak"
+        if self.meta_share is not None:
+            return self.meta_rare
+        if not playrate:
+            return False
+        return is_fringe(self.edhrec_rank, medium=medium)
+
+    @property
+    def meta_rare(self) -> bool:
+        """In under ``CUT_SHARE`` of the deck's meta archetype's lists (ADR-0059)."""
+        return self.meta_share is not None and self.meta_share < CUT_SHARE
+
+    @property
+    def least_played_key(self) -> float:
+        """Sorts the least-played card first: its meta share where the deck has a
+        meta archetype, else its EDHREC rank (unranked last)."""
+        if self.meta_share is not None:
+            return self.meta_share
+        return -(self.edhrec_rank if self.edhrec_rank is not None else 10**9)
+
+
+# The repeatable-draw commander keys that arm the hellbent anti-synergy
+# predicate (ADR-0040 §2: a "no cards in hand"-gated grant under a
+# draw-engine commander never turns on — Sliver Weftwinder draws per ETB).
+_DRAW_ENGINE_KEYS = frozenset({"card_draw_engine", "draw_for_each"})
+
+
+def _commander_draws(hd: HydratedDeck, commander_names: set[str]) -> bool:
+    from mtg_utils.theme_presets import _signal_keys_for
+
+    return any(
+        _signal_keys_for(rec) & _DRAW_ENGINE_KEYS
+        for rec in hd.records
+        if rec.get("name") in commander_names
+    )
+
+
+def classify_deck(
+    hd: HydratedDeck,
+    deck_signals: list,
+    commander_names: set[str],
+    *,
+    zones: tuple[str, ...] = ("commanders", "cards"),
+    deck_mana: DeckMana | None = None,
+    meta: MetaContext | None = None,
+) -> list[CardClass]:
+    """Classify every distinct card in ``zones`` (one record per name, quantities
+    summed — the counted deck: commanders + main deck, never the sideboard).
+
+    ``deck_mana`` (``hd.deck_mana``) is the deck context the ramp role reads: a
+    rock whose mana is dead under this commander fills no ramp slot. ``meta`` (the
+    deck's Arena meta archetype, ADR-0059) gives every nonland class its share.
+
+    ``served`` is the set of avenue labels the card feeds — the same
+    ``score_candidate`` machinery the Find ranker uses, so a card's tuner
+    classification can never drift from how the rest of deck-forge scores it.
+    """
+    from mtg_utils._analysis.signals import grant_payloads_for
+    from mtg_utils._tuner.ability_quality import grant_grade, has_closer_grant
+
+    draw_engine = _commander_draws(hd, commander_names)
+    out: list[CardClass] = []
+    for rec, quantity in hd.deck_quantities(zones=zones):
+        name = rec.get("name", "")
+        roles = role_of(rec, deck_mana=deck_mana)
+        served = tuple(score_candidate(rec, active_signals=deck_signals)["served"])
+        if name in commander_names:
+            bucket = "commander"
+        elif is_land(rec):
+            bucket = "land"
+        elif roles & _SPINE_ROLES:
+            bucket = "spine"
+        elif protects(rec):
+            # Protection is conditional Spine (Tier-2), never filler — and this MUST be
+            # checked before `served`: a protection card that also serves an avenue
+            # (Heroic Intervention serves "Grant protection") would otherwise bucket
+            # engine and be cut by the stranded pass while the deck reads short on it.
+            bucket = "spine"
+        elif served:
+            bucket = "engine"
+        else:
+            bucket = "filler"
+        grade: str | None = None
+        closer = False
+        if bucket == "land":
+            pass  # a land never grants anything worth grading
+        elif bucket == "commander":
+            # ADR-0040 §5 fix: grant_closer must reach the commander bucket
+            # too — the archetypal Granter (a commander granting a
+            # closer-grade ability to every recipient body) was otherwise
+            # invisible to win_conditions' closer count. grant_grade stays
+            # None: the low-value/cut-protection grade never applied to
+            # commanders (they're never a cut candidate) and still doesn't.
+            closer = has_closer_grant(grant_payloads_for(rec))
+        else:
+            payloads = grant_payloads_for(rec)
+            grade = grant_grade(payloads, draw_engine_commander=draw_engine)
+            closer = has_closer_grant(payloads)
+        out.append(
+            CardClass(
+                name=name,
+                bucket=bucket,
+                roles=tuple(sorted(roles)),
+                served=served,
+                dual_purpose=(bucket == "spine" and bool(served)),
+                cmc=effective_mana_value(rec),
+                record=rec,
+                edhrec_rank=rec.get("edhrec_rank"),
+                grant_grade=grade,
+                grant_closer=closer,
+                quantity=quantity,
+                meta_share=(
+                    meta.share(name)
+                    if meta is not None and bucket not in ("commander", "land")
+                    else None
+                ),
+            )
+        )
+    return out

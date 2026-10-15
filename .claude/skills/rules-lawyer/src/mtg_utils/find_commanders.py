@@ -1,0 +1,296 @@
+"""Find commander-eligible cards from a parsed deck/collection JSON."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import click
+
+from mtg_utils._name_index import NameIndex
+from mtg_utils._sidecar import atomic_write_json, sha_keyed_path
+from mtg_utils.card_classify import (
+    PartnerAbility,
+    can_partner,
+    color_identity_subset,
+    get_oracle_text,
+    partner_abilities,
+)
+from mtg_utils.card_pool import CardPool
+from mtg_utils.deck import collect_card_entries
+from mtg_utils.formats import FORMATS, get_format
+
+CARD_FIELDS = (
+    "name",
+    "color_identity",
+    "type_line",
+    "mana_cost",
+    "cmc",
+    "edhrec_rank",
+    "game_changer",
+)
+
+
+#: The partner abilities ``is_partner`` reports (CR 702.124h-j, 702.124m): partner,
+#: partner—[text], partner with [name], Doctor's companion (which pairs with a Time
+#: Lord Doctor). Choose a Background (702.124k) is reported on its own.
+_PAIRING_KINDS = frozenset({"plain", "group", "with", "doctors_companion"})
+
+
+def _partner_fields(abilities: frozenset[PartnerAbility]) -> dict:
+    """The candidate's pairing fields from ``card_classify.partner_abilities`` —
+    the pairing kinds: its partner abilities (CR 702.124a: partner, partner—[text],
+    partner with [name], choose a Background, Doctor's companion; read off the
+    trees' ``Partner`` keywords, legendary-gated) plus the type-line kinds a partner
+    ability pairs with (a Background, a Time Lord Doctor — 702.124k, 702.124m),
+    which aren't partner abilities themselves. ``partner_kinds`` lists them as
+    ``{"kind", "value"}`` (``group`` carries its partner—[text], ``with`` its named
+    partner); ``is_partner``, ``partner_with`` (702.124j) and
+    ``has_background_clause`` (702.124k) derive from them."""
+    ordered = sorted(abilities)
+    kinds = {a.kind for a in ordered}
+    return {
+        "partner_kinds": [{"kind": a.kind, "value": a.value} for a in ordered],
+        "is_partner": bool(kinds & _PAIRING_KINDS),
+        "partner_with": next((a.value for a in ordered if a.kind == "with"), None),
+        "has_background_clause": "choose_background" in kinds,
+    }
+
+
+def _pairings(rows: list[tuple[dict, frozenset[PartnerAbility], dict]]) -> None:
+    """Fill each candidate's ``pairs_with`` (rows are ``(candidate, its pairing
+    kinds, its card)``): the other candidates it can share the command zone with
+    (``card_classify.can_partner`` — one kind of each card must match, CR 702.124f:
+    different partner abilities can't be combined, so a Survivors card pairs only
+    with Survivors, a plain partner only with partner)."""
+    for cand, mine, _card in rows:
+        cand["pairs_with"] = [
+            other["name"]
+            for other, _kinds, card in rows
+            if mine and other is not cand and can_partner(mine, card)
+        ]
+
+
+def _build_owned_index(parsed_deck: dict, min_quantity: int) -> dict[str, int]:
+    """Map normalized card name -> owned quantity for entries meeting min_quantity.
+
+    Considers both the cards list and the commanders list — a user might have
+    a parsed deck where the legendary creature they want to evaluate as
+    commander currently lives in the cards list, or vice versa. When a card
+    appears in BOTH sections, takes the max rather than the sum: the two
+    sections describe the same physical pile from the user's perspective,
+    and parse-deck can emit a card in commanders AND cards if the user
+    listed their commander in the mainboard for any reason.
+    """
+    entries = collect_card_entries(
+        parsed_deck,
+        include_sideboard=False,  # you don't find a commander in a sideboard
+        reconcile="max",
+        min_quantity=min_quantity,
+    )
+    return {key: qty for key, (_name, qty) in entries.items()}
+
+
+def _build_candidate(
+    card: dict, owned_quantity: int, abilities: frozenset[PartnerAbility]
+) -> dict:
+    oracle = get_oracle_text(card)
+    result = {field: card.get(field) for field in CARD_FIELDS}
+    result["oracle_text"] = oracle or None
+    result.update(_partner_fields(abilities))
+    result["owned_quantity"] = owned_quantity
+    # game_changer collapses to bool because the agent only cares about
+    # presence; edhrec_rank deliberately stays None when missing so the
+    # agent can distinguish "no EDHREC data" from "rank 0".
+    result["game_changer"] = bool(result.get("game_changer"))
+    return result
+
+
+def find_commanders(
+    parsed_deck: dict,
+    bulk_index: NameIndex,
+    *,
+    format: str = "commander",  # noqa: A002
+    color_identity: str | None = None,
+    min_quantity: int = 1,
+) -> list[dict]:
+    """Return commander-eligible cards owned in the parsed deck/collection.
+
+    Filters by:
+      - owned quantity >= min_quantity
+      - format legality + commander eligibility (``Format.commander_eligibility``)
+      - optional color-identity subset
+    """
+    fmt = get_format(format)
+    allowed_colors = set(color_identity.upper()) if color_identity else None
+
+    owned = _build_owned_index(parsed_deck, min_quantity)
+
+    rows: list[tuple[dict, frozenset[PartnerAbility], dict]] = []
+    for name_key, qty in owned.items():
+        card = bulk_index.get(name_key)
+        if card is None:
+            continue
+        if not fmt.commander_eligibility(card)["eligible"]:
+            continue
+        if allowed_colors is not None and not color_identity_subset(
+            card.get("color_identity") or [],
+            allowed_colors,
+        ):
+            continue
+        abilities = partner_abilities(card)
+        rows.append((_build_candidate(card, qty, abilities), abilities, card))
+
+    rows.sort(key=lambda row: row[0]["name"])
+    _pairings(rows)
+    return [cand for cand, _abilities, _card in rows]
+
+
+def _default_output_path(
+    parsed_deck_content: str,
+    fmt: str,
+    color_identity: str | None,
+    min_quantity: int,
+    bulk_path: Path,
+) -> Path:
+    """Compute a deterministic sha-keyed output path under $TMPDIR.
+
+    Hashes the parsed-deck content, the filter arguments, AND the bulk data
+    file (by mtime+size) so the same query against the same collection lands
+    at the same file, but different queries OR a refreshed bulk data file
+    get their own files. Without hashing bulk_path, a `download-mtgjson` refresh
+    would silently return stale recommendations.
+    """
+    return sha_keyed_path(
+        "find-commanders",
+        parsed_deck_content,
+        fmt,
+        color_identity or "",
+        min_quantity,
+        bulk_path,
+    )
+
+
+def _render_text_table(candidates: list[dict], *, format: str) -> str:  # noqa: A002
+    """Render the candidate list as a compact human-readable table.
+
+    Column set is chosen for decision-making: EDHREC rank, color identity, CMC,
+    name, truncated type_line, and a flags column that surfaces PARTNER /
+    BACKGROUND / GC (game_changer) signals in a single glance. An "Owned pairings"
+    list follows when two candidates can be commanders together (``pairs_with``).
+    """
+    if not candidates:
+        return f"find-commanders: 0 candidates (format={format})\n"
+
+    lines: list[str] = []
+    lines.append(
+        f"find-commanders: {len(candidates)} candidates (format={format})",
+    )
+    lines.append("")
+    header = f"  {'EDHREC':>6}  {'CI':<5} {'CMC':>4}  {'Name':<36}  {'Type':<36}  Flags"
+    divider = "  " + "-" * (len(header) - 2)
+    lines.append(header)
+    lines.append(divider)
+
+    for c in candidates:
+        rank = c.get("edhrec_rank")
+        rank_str = f"{rank:>6}" if rank is not None else "  ----"
+        ci = "".join(c.get("color_identity") or []) or "C"
+        cmc_val = c.get("cmc")
+        cmc_str = f"{int(cmc_val):>4}" if cmc_val is not None else "   -"
+        name = (c.get("name") or "")[:36]
+        type_line = (c.get("type_line") or "")[:36]
+        flags: list[str] = []
+        if c.get("is_partner"):
+            flags.append("PARTNER")
+        if c.get("has_background_clause"):
+            flags.append("BACKGROUND")
+        flags.append("GC=yes" if c.get("game_changer") else "GC=no")
+        flag_str = " ".join(flags)
+        lines.append(
+            f"  {rank_str}  {ci:<5} {cmc_str}  {name:<36}  {type_line:<36}  {flag_str}",
+        )
+
+    pairs = sorted(
+        {
+            tuple(sorted((c["name"], other)))
+            for c in candidates
+            for other in c.get("pairs_with") or ()
+        }
+    )
+    if pairs:
+        lines.append("")
+        lines.append(f"Owned pairings ({len(pairs)}):")
+        lines.extend(f"  {a} + {b}" for a, b in pairs)
+
+    return "\n".join(lines) + "\n"
+
+
+@click.command()
+@click.argument(
+    "parsed_deck_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--bulk-data",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Path to Scryfall bulk data JSON.",
+)
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(sorted(FORMATS)),
+    default="commander",
+    help="Target format (default: commander).",
+)
+@click.option(
+    "--color-identity",
+    default=None,
+    help="Filter to commanders whose color identity is a subset of these colors "
+    "(e.g. BG, WUBRG). Optional.",
+)
+@click.option(
+    "--min-quantity",
+    type=int,
+    default=1,
+    help="Minimum owned quantity to consider a card (default: 1). "
+    "Use 0 to include wishlist/binder rows.",
+)
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Override the default sha-keyed path for the full JSON output.",
+)
+def main(
+    parsed_deck_path: Path,
+    bulk_data: Path,
+    fmt: str,
+    color_identity: str | None,
+    min_quantity: int,
+    output_path: Path | None,
+) -> None:
+    """Find commander-eligible cards in a parsed deck/collection JSON."""
+    parsed_deck_content = parsed_deck_path.read_text(encoding="utf-8")
+    parsed_deck = json.loads(parsed_deck_content)
+    bulk_index = CardPool.load(bulk_data).by_name
+    candidates = find_commanders(
+        parsed_deck,
+        bulk_index,
+        format=fmt,
+        color_identity=color_identity,
+        min_quantity=min_quantity,
+    )
+
+    if output_path is None:
+        output_path = _default_output_path(
+            parsed_deck_content, fmt, color_identity, min_quantity, bulk_data
+        )
+    else:
+        output_path = output_path.resolve()
+    atomic_write_json(output_path, candidates)
+
+    click.echo(_render_text_table(candidates, format=fmt), nl=False)
+    click.echo(f"\nFull JSON: {output_path}")

@@ -1,0 +1,205 @@
+<script>
+  import { avenues, activeTab, applySnapshot } from "../lib/store.js";
+  import { api } from "../lib/api.js";
+
+  // Scope is only shown when it's contrastive — "yours" is the unremarkable default,
+  // so we surface only the cases that change how you build (opponents' / each player).
+  const SCOPE_TAG = { opponents: "opponents'", each: "each player" };
+
+  // A lane chip is a focus toggle: pin/unpin it and jump to the Find tab, where the
+  // focused set OR-drives a ranked candidate list (ADR-0015). Multi-select by pinning
+  // several. The ✦ shows focused state.
+  async function toggleFocus(avenue) {
+    const r = await api.focusAvenue(avenue.id);
+    if (r.ok) {
+      applySnapshot(r.data);
+      activeTab.set("find");
+    }
+  }
+
+  async function remove(avenue) {
+    const r = await api.removeAvenue(avenue.id);
+    if (r.ok) applySnapshot(r.data);
+  }
+
+  $: focusedCount = $avenues.filter((a) => a.focused).length;
+
+  // Collapsible (#6): the avenue list grows with the deck and crowds the column, so the
+  // header toggles it shut. Open by default; when open the chips scroll past a cap rather
+  // than pushing the deck off-screen.
+  let open = true;
+</script>
+
+{#if $avenues.length}
+  <div class="panel avenues">
+    <button
+      class="panel-title toggle"
+      type="button"
+      aria-expanded={open}
+      on:click={() => (open = !open)}
+    >
+      <span class="caret">{open ? "▾" : "▸"}</span>
+      Avenues · what your deck cares about
+      <span class="count">{$avenues.length}</span>
+    </button>
+    {#if open}
+      <div class="chips">
+        {#each $avenues as a (a.id)}
+          <button
+            class="avenue"
+            class:agent={a.source === "agent"}
+            class:focused={a.focused}
+            title={a.focused
+              ? (a.description || a.label) + " — focused; click to unpin"
+              : (a.description || a.label) +
+                " — click to focus this lane in Find"}
+            on:click={() => toggleFocus(a)}
+          >
+            <span class="pin" class:on={a.focused}>✦</span>
+            <span class="label">{a.label}</span>
+            {#if SCOPE_TAG[a.scope]}<span class="scope"
+                >{SCOPE_TAG[a.scope]}</span
+              >{/if}
+            {#if a.source === "agent"}
+              <span
+                class="rm"
+                role="button"
+                tabindex="0"
+                title="Remove this avenue"
+                on:click|stopPropagation={() => remove(a)}
+                on:keydown|stopPropagation={(e) =>
+                  e.key === "Enter" ? remove(a) : null}>×</span
+              >
+            {/if}
+          </button>
+        {/each}
+      </div>
+      <p class="hint">
+        {#if focusedCount}
+          <b class="lit">✦ {focusedCount} focused</b> — these lanes drive the ranked
+          Find list. Click a lane to pin / unpin.
+        {:else}
+          Click a lane to pin <span class="lit">✦</span> it — focused lanes
+          drive a ranked, real-card candidate list in <b>Find</b>.
+        {/if}
+      </p>
+    {/if}
+  </div>
+{/if}
+
+<style>
+  .avenues {
+    padding: 0.9rem 1rem;
+    /* spacing between deck-col children is owned by the parent's `gap` now;
+       a margin here doubled the Avenues→Curve gap vs Curve→Deck. */
+    flex-shrink: 0;
+  }
+  /* a clickable header that keeps the panel-title look but collapses the list (#6) */
+  .toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+  }
+  .caret {
+    color: var(--muted);
+    font-size: 0.75rem;
+    line-height: 1;
+  }
+  .count {
+    margin-left: auto;
+    font-size: 0.7rem;
+    color: var(--muted);
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 999px;
+    padding: 0.05rem 0.45rem;
+  }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    /* cap the height so a deck with many avenues scrolls here instead of shoving the
+       deck list below the fold (#6) */
+    margin-top: 0.6rem;
+    max-height: 8.5rem;
+    overflow-y: auto;
+  }
+  .avenue {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.32rem 0.6rem;
+    border: 1px solid var(--hairline);
+    border-left: 3px solid var(--brass);
+    border-radius: var(--radius);
+    background: rgba(200, 150, 75, 0.07);
+    color: var(--parchment);
+    font-family: var(--body);
+    font-size: 0.82rem;
+    transition: all 0.14s ease;
+  }
+  .avenue:hover {
+    border-color: var(--brass-bright);
+    background: rgba(255, 106, 61, 0.12);
+    transform: translateY(-1px);
+  }
+  /* agent-discovered avenues get the ember accent to distinguish from engine ones */
+  .avenue.agent {
+    border-left-color: var(--ember);
+  }
+  /* a pinned lane: full ember frame + glow, so the focused set reads at a glance */
+  .avenue.focused {
+    border-color: var(--ember);
+    border-left-color: var(--ember);
+    background: rgba(255, 106, 61, 0.12);
+    box-shadow: 0 0 12px rgba(255, 106, 61, 0.18);
+  }
+  .pin {
+    color: var(--muted);
+    font-size: 0.8rem;
+    line-height: 1;
+    opacity: 0.55;
+    transition: all 0.14s ease;
+    cursor: pointer;
+  }
+  .pin:hover {
+    color: var(--brass-bright);
+    opacity: 1;
+  }
+  .pin.on {
+    color: var(--ember);
+    opacity: 1;
+    text-shadow: 0 0 8px rgba(255, 106, 61, 0.6);
+  }
+  .lit {
+    color: var(--ember);
+    font-style: normal;
+  }
+  .scope {
+    font-size: 0.66rem;
+    color: var(--warn);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .rm {
+    color: var(--muted);
+    font-size: 0.9rem;
+    line-height: 1;
+    padding: 0 0.1rem;
+    border-radius: 3px;
+  }
+  .rm:hover {
+    color: var(--fail);
+  }
+  .hint {
+    margin: 0.6rem 0 0;
+    font-size: 0.72rem;
+    font-style: italic;
+    color: var(--muted);
+  }
+</style>

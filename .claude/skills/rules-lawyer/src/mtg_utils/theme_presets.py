@@ -1,0 +1,3891 @@
+"""Theme presets for archetype detection.
+
+A canonical, tested library of named matchers for common MTG mechanics.
+Each preset bundles a keyword list (matched against Scryfall's ``keywords``
+array), a list of regex patterns (matched against oracle text), and/or a
+STRUCTURAL VIEW over the production signal extractor (see "Structural
+views" below). Callers use ``get_preset(name).matches(card)`` to test a
+single card.
+
+Presets ship with test fixtures (``should_match`` / ``should_not_match``
+card-name tuples). ``tests/mtg-utils/test_theme_presets.py`` pins each
+preset against those fixtures so regex drift is caught before landing.
+
+# Why keywords, not just regex
+
+Scryfall's ``keywords`` array is the authoritative source for named
+keyword abilities. Matching by keyword avoids the false-positive problem
+regex has with flavor text, reminder text on older printings, and cards
+that mention a keyword without having it (e.g. "Target creature gets
+flying"). When a theme is a keyword ability (flying, scry, flashback,
+cascade, cycling, …) the preset uses the keyword list only.
+
+Regex used to be reserved for FUNCTIONAL themes without a matching
+keyword and without a structural view yet (removal, mill, reanimate,
+counterspells, burn, tokens, …) — task #86 flipped ``removal``, the last
+one, so no BUILT-IN preset carries a raw ``patterns`` arm anymore. The
+only live regex path left is USER-SUPPLIED: ``archetype_audit``'s
+``--theme name=regex`` CLI flag and a cube's ``designer_intent.
+stated_archetypes`` custom-regex entries (``_archetype_resolver.
+CustomRegexArchetype``) — a cube author's own pattern for a theme the
+presets don't name at all, never a second detector shadowing the signal
+extractor. Both build a one-off ``Preset`` directly (still using the
+``patterns``/``type_patterns`` fields and matching machinery below —
+those stay live for this user-supplied path) rather than registering a
+new entry in the curated ``PRESETS`` dict.
+
+# Structural views (task #83, ADR-0035/0039)
+
+A regex/keyword preset is a hand-rolled SECOND detector shadowing the
+production signal extractor (``mtg_utils._analysis.signals.
+extract_signals``, the crosswalk read over phase-rs's parse). Per
+Dan's directive (2026-07-12), presets are being migrated one lane at a
+time into DECLARATIVE VIEWS over that extractor's own output — never a
+third detector system:
+
+- ``signal_keys``: the card matches if its production signal keyset
+  (memoized per ``oracle_id`` — see :func:`_signal_keys_for`) intersects
+  these keys. This is the primary conversion mechanism — most presets
+  map onto exactly one signal key (``landfall`` → the ``landfall`` key,
+  ``sacrifice-outlet`` → ``sacrifice_outlets``, …).
+- ``keywords`` stays live and UNIONS with ``signal_keys`` where a
+  Scryfall keyword-array fact isn't fully folded into the signal lane
+  (a keyword-only maker the effect lane doesn't independently derive —
+  ``landfall``'s ``Landfall`` keyword is one such case; see the
+  per-preset conversion note).
+- ``concept``: an OPTIONAL named predicate, ``(card) -> bool``, for a
+  fact the signal system doesn't carry at all. Two motivating cases so
+  far: (1) a target's PERMANENT TYPE — ``removal``/``exile_removal``/
+  ``mass_removal``/``edict_makers`` all emit ``subject=""``, so "this
+  card is removal" never says WHICH type it answers; the 10 type-scoped
+  removal/edict presets (creature/artifact/enchantment/land/planeswalker/
+  universal x removal/edict) bind ``_removal_edict_concept`` to a target
+  permanent type. (2) a shared key covering several distinct facts, or a
+  fact needing a different query mode than the key index caches — the
+  'graveyard-return' / 'self-mill' / 'card-draw' / 'blink' conversions
+  each bind a thin per-card glue wrapper (``_graveyard_return_concept``,
+  ``_self_mill_concept``, ``_etb_bulk_draw_concept``,
+  ``_blink_maker_concept``). In both cases a concept predicate MUST reuse
+  an existing crosswalk lane helper (``mtg_utils._deck_forge.
+  the lanes package`` — e.g. ``removal_edict_targets_type``) rather than
+  hand-roll a new text scan — the TREE-level logic lives next to the lane
+  helper(s) it reuses, with the same docstring discipline as the lane
+  itself; the per-card glue (resolving the card's per-face trees, or —
+  for ``blink`` — calling ``extract_signals`` directly) lives in
+  THIS module next to :func:`_signal_keys_for`. Because
+  :meth:`Preset.matches` only ORs its arms (there is no AND), a concept
+  predicate that needs "is removal/edict of SOME kind AND targets THIS
+  type" does the full walk itself rather than intersecting against
+  ``signal_keys`` at the ``Preset`` level.
+
+A converted preset drops its ``patterns`` (the regex is superseded by the
+view, not run in parallel) and keeps ``keywords`` only for facts the
+signal system genuinely doesn't reproduce. Every arm — ``keywords``,
+``patterns``, ``type_patterns``, ``layouts``, ``signal_keys``,
+``concept`` — still combines with OR in :meth:`Preset.matches`, so a
+partially-converted registry (some presets structural, most still regex)
+behaves identically from every existing call site's point of view; the
+public API (``Preset.matches`` / ``get_preset`` / ``matches`` /
+``list_presets`` / ``PRESETS``) is unchanged.
+
+# Public API
+
+- :class:`Preset` — frozen dataclass with name, description, match
+  conditions, and test fixtures.
+- :func:`get_preset` — look up a preset by name.
+- :func:`matches` — convenience wrapper around ``get_preset(name).matches(card)``.
+- :func:`list_presets` — ``name -> description`` for discoverability.
+- :func:`has_signal_coverage` — whether the signal path can see a card at all
+  (the gate a caller with a text degrade reads).
+- :data:`PRESETS` — the full registry as a frozen dict.
+"""
+
+from __future__ import annotations
+
+import re
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
+from typing import TYPE_CHECKING
+
+from mtg_utils.card_classify import get_oracle_text, is_land
+
+if TYPE_CHECKING:
+    # Type-only: mtg_utils._card_ir.crosswalk has no _deck_forge dependency
+    # (verified), so this import is safe even at runtime, but every OTHER
+    # crosswalk-adjacent import in this module is lazy (see _signal_keys_for
+    # / _concept_any_face's own docstrings) to dodge an import-time cycle
+    # with _analysis.signals — keeping this one TYPE_CHECKING-only too
+    # keeps the whole module's import discipline uniform.
+    from mtg_utils._card_ir.crosswalk import ConceptTree
+
+# Matches a count in digit form, word form (one..twelve), or X. IGNORECASE
+# is applied at pattern compile time, so word forms match "Three" too.
+# Unused by any PRESETS entry as of task #86 (the removal flip retired the
+# last built-in preset with a raw ``patterns`` arm) — kept for a future
+# genuinely-textual fact.
+_COUNT = r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|X)"
+
+
+@dataclass(frozen=True)
+class Preset:
+    """A named, testable theme matcher.
+
+    A card matches if ANY declared condition matches:
+
+    - ``keywords``: the card's ``keywords`` array contains any of these
+      (case-insensitive).
+    - ``patterns``: any regex matches the card's oracle text.
+    - ``type_patterns``: any regex matches the card's ``type_line``.
+      Useful for kindred/tribal themes where the card's identity comes
+      from its creature type (e.g., Llanowar Elves is an Elf whether or
+      not its oracle mentions the word).
+    - ``layouts``: the card's Scryfall ``layout`` field equals one of
+      these (case-sensitive, matching Scryfall values like
+      ``"adventure"``, ``"prototype"``, ``"split"``, ``"saga"``).
+    - ``signal_keys``: the card's production signal keyset (see the
+      module docstring's "Structural views" section) intersects these
+      keys. Empty for every not-yet-converted preset.
+    - ``concept``: an optional ``(card) -> bool`` predicate for a fact
+      neither the regex arms nor the signal system carry. ``None`` for
+      every preset today.
+
+    All six may be set; they combine with OR. ``should_match`` and
+    ``should_not_match`` are card-name fixtures the test suite proves
+    against the committed real-card snapshot (``mtg_utils.testkit`` — a
+    real Scryfall record, and for a structural arm real crosswalk trees;
+    ``build-card-snapshot`` reads these names from the registry itself).
+    ``should_not_match`` holds at least one NEAR MISS — a card that grants,
+    mentions or resembles the theme without having it; a generic unrelated
+    card (Lightning Bolt) may sit beside it but never stands alone (see
+    ``test_theme_presets.py``).
+    """
+
+    name: str
+    description: str
+    keywords: tuple[str, ...] = ()
+    patterns: tuple[re.Pattern[str], ...] = ()
+    type_patterns: tuple[re.Pattern[str], ...] = ()
+    layouts: tuple[str, ...] = ()
+    signal_keys: tuple[str, ...] = ()
+    concept: Callable[[dict], bool] | None = None
+    should_match: tuple[str, ...] = ()
+    should_not_match: tuple[str, ...] = ()
+    #: Provenance for maintainers — the structural-view conversion notes (which
+    #: signal keys the view reads, recall vs the old regex, the named residual) —
+    #: NEVER served: ``description`` is the player-facing blurb the UI shows.
+    notes: str = ""
+
+    def matches(self, card: dict) -> bool:
+        if self.keywords:
+            card_kws = {k.lower() for k in (card.get("keywords") or [])}
+            if card_kws & {k.lower() for k in self.keywords}:
+                return True
+        if self.patterns:
+            oracle = get_oracle_text(card)
+            if any(p.search(oracle) for p in self.patterns):
+                return True
+        if self.type_patterns:
+            type_line = card.get("type_line") or ""
+            if any(p.search(type_line) for p in self.type_patterns):
+                return True
+        if self.layouts and card.get("layout") in self.layouts:
+            return True
+        if self.signal_keys and _signal_keys_for(card) & set(self.signal_keys):
+            return True
+        return self.concept is not None and self.concept(card)
+
+
+# ─── Structural-view seam (task #83, ADR-0035/0039; sidecar-seeded task #90) ──
+#
+# oracle_id -> frozenset(production signal key) index, populated either by a
+# per-card LIVE compute (the first time any signal_keys-bearing preset sees
+# that card — the original, no-bulk/no-sidecar/CI-safe path) or, when a whole-
+# pool caller has called :func:`seed_signal_key_index`, in bulk from the
+# persisted ``_analysis.signals_index`` sidecar (task #90) — an oracle_id ->
+# "key|scope|subject" idents pickle keyed off the bulk file + every signal-
+# source file's content, built ONCE and reused across processes. Either way
+# this dict is the SAME cache: a card_search.py-style full-pool scan pays one
+# extract_signals call per card overall on a COLD sidecar (same as
+# before conversion), but a WARM sidecar (or a second structural preset
+# scanning the same pool / the same card revisited by a different consumer in
+# one process) is a dict lookup, no crosswalk re-run. extract_signals
+# itself already memoizes the expensive part (_ir_lookup.trees_for's per-face
+# ConceptTree resolution) per oracle_id, so this index is a second, cheaper
+# memoization layer on top of that one — the (key, scope, subject) -> Signal
+# lane pass, not the tree build.
+_SIGNAL_KEY_INDEX: dict[str, frozenset[str]] = {}
+
+
+def _signal_keys_for(card: dict) -> frozenset[str]:
+    """CARD's production signal-key set (memoized per ``oracle_id``).
+
+    Empty for a card with no ``oracle_id`` (a synthetic fixture — the same
+    "no oracle_id" degradation ``extract_signals`` documents) or
+    whose oracle_id resolves to no phase parse at all — a structural-view
+    preset just never matches such a card, exactly like the ``keywords`` /
+    ``patterns`` arms matching nothing on a card missing the field they
+    read. Imports ``mtg_utils._analysis.signals`` LAZILY inside the
+    function body (never at module import time): a top-level import here
+    would risk an import-time cycle racing partial module initialization
+    the first time either module loads, so the lazy import stays as a
+    defensive convention.
+    """
+    oid = card.get("oracle_id")
+    if not oid:
+        return frozenset()
+    cached = _SIGNAL_KEY_INDEX.get(oid)
+    if cached is not None:
+        return cached
+    from mtg_utils._analysis.signals import extract_signals
+
+    keys = frozenset(sig.key for sig in extract_signals(card))
+    _SIGNAL_KEY_INDEX[oid] = keys
+    return keys
+
+
+def has_signal_coverage(card: dict) -> bool:
+    """Can the signal path SEE this card at all? False for the cases
+    :func:`_signal_keys_for` degrades to an empty set on — no ``oracle_id`` (a
+    synthetic fixture), or no phase parse / no card-data (``signal_trees_for``
+    resolves nothing) — so a caller with a text degrade (``_analysis.roles.
+    is_ramp``) can tell "no signals" (a vanilla creature: covered, not ramp) from
+    "no answer". A non-empty keyset is coverage by construction; only the rare
+    empty one pays the tree resolve."""
+    if _signal_keys_for(card):
+        return True
+    if not card.get("oracle_id"):
+        return False
+    from mtg_utils._analysis.signal_trees import signal_trees_for
+
+    return bool(signal_trees_for(card, bulk=card))
+
+
+# Full "key|scope|subject" idents per oracle_id — the sibling of
+# ``_SIGNAL_KEY_INDEX`` for consumers that must discriminate scope/subject
+# (``signal_specs.Serve.signal_idents``, task #96): a Sliver-tribal serve
+# matches ``type_changers|you|Sliver`` but must not match a Goblin changer.
+# Same population paths: live per-card compute here, bulk-seeded by
+# :func:`seed_signal_key_index` from the task-#90 sidecar (which already
+# stores full idents).
+_SIGNAL_IDENT_INDEX: dict[str, frozenset[str]] = {}
+
+
+def _signal_idents_for(card: dict) -> frozenset[str]:
+    """CARD's production "key|scope|subject" ident set (memoized per
+    ``oracle_id``) — :func:`_signal_keys_for`'s scope/subject-bearing
+    sibling, with the same lazy-import rationale and the same empty-set
+    degradation for a synthetic no-``oracle_id`` record."""
+    oid = card.get("oracle_id")
+    if not oid:
+        return frozenset()
+    cached = _SIGNAL_IDENT_INDEX.get(oid)
+    if cached is not None:
+        return cached
+    from mtg_utils._analysis.signals import extract_signals
+
+    idents = frozenset(
+        f"{sig.key}|{sig.scope}|{sig.subject}" for sig in extract_signals(card)
+    )
+    _SIGNAL_IDENT_INDEX[oid] = idents
+    return idents
+
+
+def forget_signal_keys(oid: str) -> None:
+    """Drop ``oid``'s memoized keys and idents, so the next read recomputes them.
+
+    For a caller that replaces the card's concept trees after they may have been
+    read (the testkit seeding real trees in a process with no phase cache): the
+    two memos above key on ``oracle_id`` alone, so without this a keyset computed
+    before the seed (empty, when no trees were available yet) outlives it."""
+    _SIGNAL_KEY_INDEX.pop(oid, None)
+    _SIGNAL_IDENT_INDEX.pop(oid, None)
+
+
+# Bulk-file identities (path, mtime_ns, size) already merged into
+# ``_SIGNAL_KEY_INDEX`` this process — makes :func:`seed_signal_key_index`
+# a no-op on every call after the first for the same bulk file.
+_SEEDED_BULK_IDENTITIES: set[tuple[str, int, int]] = set()
+# One seed at a time: the hub warms the index in a background thread at launch,
+# and a request that needs it meanwhile waits for THAT build instead of starting
+# a second one.
+_SEED_LOCK = threading.Lock()
+
+
+def seed_signal_key_index(bulk_path: Path | None) -> bool:
+    """Seed ``_SIGNAL_KEY_INDEX`` from the persisted whole-pool signals-index
+    sidecar for *bulk_path* (task #90's ``_analysis.signals_index``),
+    building that sidecar on first touch (a one-time ~2-4 min pass logged to
+    stderr) so a whole-pool preset scan (``card_search``'s ``--preset``
+    filter, ``engine``'s commander-discovery novelty sweep) stops paying a
+    live ``extract_signals`` call per card every process.
+
+    Idempotent and cheap to call repeatedly within one process: a bulk path
+    already seeded (by identity — path + mtime + size) is a no-op. Returns
+    whether a persisted index was available/buildable; ``False`` (no bulk
+    path, or the file is missing) leaves ``_SIGNAL_KEY_INDEX`` untouched —
+    ``_signal_keys_for``'s existing per-card live compute is the fallback,
+    unchanged, exactly the no-sidecar/no-bulk/CI degradation this module
+    always had.
+
+    Only ADDS entries not already cached (``setdefault``): an oracle_id
+    live-computed earlier in this same process (e.g. by a prior
+    ``_signal_keys_for`` call before the seed ran) keeps that value rather
+    than being overwritten — the two are byte-identical by construction
+    (the sidecar is built at the exact default configuration
+    ``_signal_keys_for`` calls live: see ``signals_index``'s module
+    docstring), so this is a safety margin, not a correctness dependency."""
+    if bulk_path is None:
+        return False
+    path = Path(bulk_path)
+    try:
+        if not path.is_file():
+            return False
+        identity = (str(path), path.stat().st_mtime_ns, path.stat().st_size)
+    except OSError:
+        return False
+    if identity in _SEEDED_BULK_IDENTITIES:
+        return True
+
+    from mtg_utils._analysis.signals_index import load_signals_index
+
+    with _SEED_LOCK:
+        if identity in _SEEDED_BULK_IDENTITIES:  # seeded while we waited
+            return True
+        index = load_signals_index(path)
+        if index is None:
+            return False
+        for oid, idents in index.items():
+            _SIGNAL_KEY_INDEX.setdefault(
+                oid, frozenset(ident.split("|", 1)[0] for ident in idents)
+            )
+            _SIGNAL_IDENT_INDEX.setdefault(oid, frozenset(idents))
+        _SEEDED_BULK_IDENTITIES.add(identity)
+    return True
+
+
+def _concept_any_face(card: dict, predicate: Callable[[ConceptTree], bool]) -> bool:
+    """True if ``predicate(tree)`` holds for any of CARD's per-face concept
+    trees — mirrors ``extract_signals``'s own per-face union (a
+    DFC's two faces are read independently, never merged into one tree).
+    ``False`` for a card with no ``oracle_id`` / no phase parse, the same
+    degradation :func:`_signal_keys_for` documents for the ``signal_keys``
+    arm. Shared plumbing for the tree-level concept predicates below —
+    each names the crosswalk lane helper it actually reuses in its own
+    docstring; this function only resolves the trees.
+
+    Reads the SIGNAL trees (``signal_trees_for``, ADR-0047: corrected +
+    synthesized — the identical tree shape every lane reads), so a concept
+    predicate can never diverge from the ``signal_keys``-based lane it sits
+    beside in the same preset's OR. Lazily imported for the same import-cycle
+    reason :func:`_signal_keys_for` imports ``_analysis.signals`` lazily.
+    """
+    if not card.get("oracle_id"):
+        return False
+    from mtg_utils._analysis.signal_trees import signal_trees_for
+
+    return any(predicate(tree) for tree in signal_trees_for(card))
+
+
+def _graveyard_return_concept(card: dict) -> bool:
+    """concept arm for the 'graveyard-return' preset (task #83): true when
+    ANY face's ``ChangeZone`` reads a Graveyard->Hand direction. See
+    ``lanes.graveyard_return_direction`` / ``_graveyard_makers``'s
+    own docstring for why this direction isn't exposed on the merged
+    ``graveyard_makers`` Signal (``subject=""``) — raw ``signal_keys``
+    membership on that key can't discriminate this preset from
+    reanimate/self-mill, which share the same key for their OTHER two
+    directions."""
+    from mtg_utils._analysis.lanes import graveyard_return_direction
+
+    return _concept_any_face(card, graveyard_return_direction)
+
+
+def _self_mill_concept(card: dict) -> bool:
+    """concept arm for the 'self-mill' preset (task #83): true when ANY
+    face fills YOUR OWN graveyard from YOUR OWN library. See
+    ``lanes.self_mill_fill`` for the two structural shapes it
+    reads (a self-scoped ``Mill``, or a filter ``Dig`` whose
+    ``rest_destination`` is Graveyard) — deliberately NOT a raw
+    ``signal_keys`` union of ``mill_makers``/``graveyard_makers``/
+    ``topdeck_selection``, which would match Contingency Plan (a
+    look-then-reorder-to-bottom effect, never a mill) through
+    ``topdeck_selection``'s unconditional Scry/Surveil arm."""
+    from mtg_utils._analysis.lanes import self_mill_fill
+
+    return _concept_any_face(card, self_mill_fill)
+
+
+def _etb_bulk_draw_concept(card: dict) -> bool:
+    """concept arm for the 'card-draw' preset (task #83): true when ANY
+    face draws 2+ cards off its own ETB trigger (Mulldrifter). See
+    ``lanes.etb_bulk_draw``. Unions (OR) with this preset's
+    ``signal_keys=("card_draw_engine",)`` arm; the two arms are
+    structurally disjoint by construction (``card_draw_engine``'s bulk
+    gate excludes an ``enters`` unit, ``etb_bulk_draw`` requires one), so
+    the OR never double-counts a card under both arms."""
+    from mtg_utils._analysis.lanes import etb_bulk_draw
+
+    return _concept_any_face(card, etb_bulk_draw)
+
+
+def _blink_maker_concept(card: dict) -> bool:
+    """concept arm for the 'blink' preset (task #83): true when CARD
+    carries a MAKER-half ``blink_flicker`` signal (Flickerwisp/Ephemerate/
+    Soulherder), never :func:`~mtg_utils._analysis.lanes.
+    apply_membership_floor`'s "worth blinking" payoff cross-open (Academy
+    Journeymage/Mulldrifter). See ``lanes.
+    blink_flicker_maker_present``. Unions (OR) with this preset's
+    ``signal_keys=("self_blink",)`` arm — a genuinely different
+    self-flicker engine (CR 611.2b, a card exiling and returning ITSELF,
+    Aetherling) sharing no cards with the maker-of-OTHERS shape this
+    predicate reads."""
+    from mtg_utils._analysis.lanes import blink_flicker_maker_present
+
+    return blink_flicker_maker_present(card)
+
+
+def _plus_one_counters_self_grow_concept(card: dict) -> bool:
+    """concept arm for the 'plus-one-counters' preset (task #85): the
+    ``self_counter_grow`` KEY minus its ``synth_self_power_scale`` cross-
+    open (Esper Sentinel, the Khenra cycle — a card whose value scales
+    with its OWN power, never a +1/+1 counter reference). See
+    ``lanes.self_counter_grow_narrow`` for why the raw key is
+    too broad for THIS preset specifically. Unions (OR) with this
+    preset's ``signal_keys=("plus_one_makers", "plus_one_matters",
+    "counter_distribute")`` arm."""
+    from mtg_utils._analysis.lanes import self_counter_grow_narrow
+
+    return _concept_any_face(card, self_counter_grow_narrow)
+
+
+# The signal keys whose doers are mana acceleration outright. ``treasure_makers``
+# is NOT here — phase scopes a giveaway "you" too, so :func:`_ramp_concept` reads
+# the token's owner instead. Nor is ``firebending_makers``: firebending isn't ramp
+# (Dan, 2026-10-09) — its mana comes only as the creature attacks and lasts until
+# end of combat (CR 702.189a), so it never casts a bigger spell sooner. That holds
+# for a bearer (Uncle Iroh), a maker of firebending tokens (Fire Nation Attacks)
+# and a grant (Sozin's Comet) alike; a firebending card with real mana besides
+# (The Legend of Roku's chapter II ritual) is ramp through that mana.
+_RAMP_SIGNAL_KEYS = frozenset({"ramp", "mana_amplifier", "extra_land_drop"})
+
+
+def _ramp_concept(card: dict) -> bool:
+    """concept arm for the 'ramp' preset — the WHOLE match (no ``signal_keys`` arm),
+    because the template's ramp role is an AND the preset's OR can't say: a NONLAND
+    card (a land is the mana base, CR 305 — and the ``ramp`` key fires for fixing
+    lands) that carries one of
+
+    * a :data:`_RAMP_SIGNAL_KEYS` key (rocks / dorks / rituals / granted mana /
+      land-fetch-to-battlefield, mana amplifiers, a land PUT);
+    * a Treasure maker whose token YOU keep (``lanes.treasure_maker_you_keep`` —
+      An Offer You Can't Refuse hands its Treasures to an opponent);
+    * an extra land PLAY (``lanes.additional_land_play`` — Exploration, Azusa; CR
+      305.2), which the lanes route to ``landfall``, a key that also covers pure
+      payoffs.
+    """
+    if is_land(card):
+        return False
+    if _signal_keys_for(card) & _RAMP_SIGNAL_KEYS:
+        return True
+    from mtg_utils._analysis.lanes import (
+        additional_land_play,
+        treasure_maker_you_keep,
+    )
+
+    return _concept_any_face(
+        card, lambda tree: treasure_maker_you_keep(tree) or additional_land_play(tree)
+    )
+
+
+#: Graveyard-recursion keywords phase v0.94.0+ drops on some cards, so the
+#: ``self_recurring`` key can't see them (Dawn's aftermath half, Garza's Assassin's
+#: recover, Salvation Colossus's unearth, Oscorp Industries' mayhem). Each brings the
+#: card back out of its graveyard (CR 702.127a, 702.59a, 702.84a, 702.187a): the
+#: ``self-recurring`` preset's keywords arm reads them, and the graveyard serves
+#: (``lanes.card_advantage.comes_back_from_graveyard``) by each keyword's route;
+#: ``test_self_recurring_keyword_gap_canary`` retires each.
+SELF_RECURRING_KEYWORD_GAPS: tuple[str, ...] = (
+    "Aftermath",
+    "Recover",
+    "Unearth",
+    "Mayhem",
+)
+
+
+def _fodder_concept(card: dict) -> bool:
+    """The ``self-recurring-fodder`` preset: a creature that comes back out of the
+    graveyard by a fodder route (``lanes.card_advantage``), imported lazily for the
+    cycle :func:`_signal_keys_for` documents."""
+    from mtg_utils._analysis.lanes.card_advantage import (
+        FODDER_SELF_RETURNS,
+        comes_back_from_graveyard,
+    )
+
+    return comes_back_from_graveyard(card, FODDER_SELF_RETURNS)
+
+
+def _removal_edict_concept(
+    core_type: str, *, family: str = "removal", generous_any: bool = False
+) -> Callable[[dict], bool]:
+    """Bind a task #83 type-scoped ``concept`` predicate (creature/artifact/
+    enchantment/land/planeswalker/universal x removal/edict) to a specific
+    target CORE_TYPE. ``family`` selects the effect shape: "removal"
+    (destroy/exile/burn/fight/shrink — the default, used by the six
+    ``*-removal`` presets) or "edict" (forced sacrifice only, used by the
+    six ``*-edict`` presets — a destroy/exile/burn effect is never an
+    edict, CR 701.8 vs 701.21a). Reuses ``_analysis.lanes.
+    removal_edict_targets_type`` — the ONE lane helper every type-scoped
+    preset in this registry shares (see that function's docstring, and its
+    module's "Task #83 structural-view helper" section, for the target-
+    filter mechanics). Imported LAZILY inside the closure for the same
+    import-cycle reason :func:`_signal_keys_for` documents.
+    """
+
+    def _match(card: dict) -> bool:
+        from mtg_utils._analysis.lanes import (
+            removal_edict_targets_type,
+        )
+
+        return removal_edict_targets_type(
+            card, core_type, family=family, generous_any=generous_any
+        )
+
+    return _match
+
+
+# ─── Evergreen keyword abilities ──────────────────────────────────────────
+# These match via the card's ``keywords`` array — no regex needed.
+
+_EVERGREEN_KEYWORDS: tuple[Preset, ...] = (
+    Preset(
+        name="flying",
+        description="Creature has flying (evergreen).",
+        keywords=("Flying",),
+        should_match=("Serra Angel", "Baleful Strix"),
+        should_not_match=(
+            "Llanowar Elves",
+            "Lightning Bolt",
+            "Hangarback Walker",
+            "Ana Disciple",
+        ),
+    ),
+    Preset(
+        name="vigilance",
+        description="Creature has vigilance (evergreen).",
+        keywords=("Vigilance",),
+        should_match=("Serra Angel",),
+        should_not_match=("Llanowar Elves", "Honored Hierarch", "Reptil, Dinomorpher"),
+    ),
+    Preset(
+        name="trample",
+        description="Creature has trample (evergreen).",
+        keywords=("Trample",),
+        should_match=("Goldvein Hydra",),
+        should_not_match=("Serra Angel",),
+    ),
+    Preset(
+        name="haste",
+        description="Creature has haste (evergreen).",
+        keywords=("Haste",),
+        should_match=("Goblin Guide", "Monastery Swiftspear"),
+        should_not_match=("Serra Angel",),
+    ),
+    Preset(
+        name="deathtouch",
+        description="Creature has deathtouch (evergreen).",
+        keywords=("Deathtouch",),
+        should_match=("Baleful Strix",),
+        should_not_match=("Serra Angel",),
+    ),
+    Preset(
+        name="lifelink",
+        description="Creature has lifelink (evergreen).",
+        keywords=("Lifelink",),
+        should_match=("Tymna the Weaver",),
+        should_not_match=(
+            "Llanowar Elves",
+            "Assassin Initiate",
+            "Basri, Tomorrow's Champion",
+        ),
+    ),
+    Preset(
+        name="first-strike",
+        description="Creature has first strike (evergreen).",
+        keywords=("First strike",),
+        should_match=("White Knight",),
+        should_not_match=("Llanowar Elves", "Auriok Glaivemaster", "Enslaved Dwarf"),
+    ),
+    Preset(
+        name="double-strike",
+        description="Creature has double strike (evergreen).",
+        keywords=("Double strike",),
+        should_match=("Fury",),
+        should_not_match=("Serra Angel",),
+    ),
+    Preset(
+        name="reach",
+        description="Creature has reach (evergreen).",
+        keywords=("Reach",),
+        should_match=("Giant Spider",),
+        should_not_match=("Lightning Bolt", "Cloud Sprite", "Hookblade Veteran"),
+    ),
+    Preset(
+        name="menace",
+        description="Creature has menace (evergreen).",
+        keywords=("Menace",),
+        should_match=("Obeka, Splitter of Seconds",),
+        should_not_match=("Llanowar Elves", "Frantic Scapegoat", "Goblin Blast-Runner"),
+    ),
+    Preset(
+        name="defender",
+        description="Creature has defender (evergreen).",
+        keywords=("Defender",),
+        should_match=("Wall of Omens",),
+        should_not_match=("Serra Angel",),
+    ),
+    Preset(
+        name="flash",
+        description="Permanent has flash (evergreen).",
+        keywords=("Flash",),
+        should_match=("Snapcaster Mage", "Dictate of Erebos"),
+        should_not_match=("Lightning Bolt", "Rootwater Shaman", "Colossal Rattlewurm"),
+    ),
+    Preset(
+        name="hexproof",
+        description="Permanent has hexproof (evergreen).",
+        keywords=("Hexproof",),
+        should_match=("Invisible Stalker",),
+        should_not_match=("Lightning Bolt", "Basri, Tomorrow's Champion", "Kid Loki"),
+    ),
+    Preset(
+        name="indestructible",
+        description="Permanent has indestructible (evergreen).",
+        keywords=("Indestructible",),
+        should_match=("Darksteel Myr",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Basri, Tomorrow's Champion",
+            "Dauntless Bodyguard",
+        ),
+    ),
+    Preset(
+        name="ward",
+        description="Permanent has ward (evergreen).",
+        keywords=("Ward",),
+        # Note: Star Whale grants ward to OTHER creatures but doesn't have
+        # it itself, so it isn't a valid fixture for this preset.
+        should_match=("Armored Armadillo",),
+        should_not_match=("Lightning Bolt", "Forum Familiar", "K-9, Mark I"),
+    ),
+    Preset(
+        name="protection",
+        description="Permanent has protection from something (evergreen).",
+        keywords=("Protection",),
+        should_match=("White Knight",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Alseid of Life's Bounty",
+            "Benevolent Bodyguard",
+        ),
+    ),
+)
+
+# ─── Named non-evergreen keyword abilities ────────────────────────────────
+
+_KEYWORD_ABILITIES: tuple[Preset, ...] = (
+    Preset(
+        name="scry",
+        description="Card performs scry N (look at top, may bottom).",
+        keywords=("Scry",),
+        # Aang's Iceberg has Scry in its keywords array (its waterbend
+        # ability scries), so it matches via the Scry keyword directly.
+        should_match=("Preordain", "Omen of the Sun", "Magma Jet", "Aang's Iceberg"),
+        should_not_match=(
+            "Lightning Bolt",
+            "Arid Archway",
+            "Commercial District",
+            "Conduit Pylons",
+            "Elegant Parlor",
+        ),
+    ),
+    Preset(
+        name="surveil",
+        description="Card performs surveil N (look at top, may discard).",
+        keywords=("Surveil",),
+        should_match=("Thought Erasure", "Notion Rain", "Sinister Sabotage"),
+        # Ransack the Lab is sometimes misremembered as surveil but its actual
+        # oracle text is "Look at the top three ... put the rest into your
+        # graveyard" — no Surveil keyword.
+        should_not_match=("Lightning Bolt", "Ransack the Lab"),
+    ),
+    Preset(
+        name="cascade",
+        description="Spell has cascade.",
+        keywords=("Cascade",),
+        should_match=("Bloodbraid Elf", "Shardless Agent"),
+        should_not_match=("Lightning Bolt", "Bloodbraid Marauder", "Flamekin Herald"),
+    ),
+    Preset(
+        name="flashback",
+        description="Spell has flashback.",
+        keywords=("Flashback",),
+        should_match=("Lingering Souls", "Faithless Looting", "Deep Analysis"),
+        should_not_match=("Lightning Bolt", "Archmage's Newt", "Rootcoil Creeper"),
+    ),
+    Preset(
+        name="kicker",
+        description="Spell has a kicker cost.",
+        keywords=("Kicker",),
+        should_match=("Gatekeeper of Malakir",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Coralhelm Chronicler",
+            "Everflowing Chalice",
+        ),
+    ),
+    Preset(
+        name="cycling",
+        description="Card has cycling.",
+        keywords=("Cycling",),
+        should_match=("Ketria Triome",),
+        should_not_match=("Lightning Bolt", "Rhet-Tomb Mystic", "Jo Grant"),
+    ),
+    Preset(
+        name="evoke",
+        description="Creature has evoke.",
+        keywords=("Evoke",),
+        should_match=("Mulldrifter", "Fury"),
+        should_not_match=(
+            "Lightning Bolt",
+            "Ashling, the Limitless",
+            "Boseiju, Who Endures",
+        ),
+    ),
+    Preset(
+        name="ninjutsu",
+        description="Creature has ninjutsu.",
+        keywords=("Ninjutsu",),
+        should_match=("Fallen Shinobi",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Satoru Umezawa",
+            "Yuriko, the Tiger's Shadow",
+        ),
+    ),
+    Preset(
+        name="exalted",
+        description="Permanent has exalted.",
+        keywords=("Exalted",),
+        should_match=("Noble Hierarch", "Qasali Pridemage"),
+        should_not_match=(
+            "Lightning Bolt",
+            "Merchant of Truth",
+            "Rashel, Fist of Torm",
+        ),
+    ),
+    Preset(
+        name="prowess",
+        description="Creature has prowess.",
+        keywords=("Prowess",),
+        should_match=("Monastery Swiftspear", "Abbot of Keral Keep"),
+        should_not_match=(
+            "Lightning Bolt",
+            "Triton Wavebreaker",
+            "Narset, Enlightened Exile",
+        ),
+    ),
+    Preset(
+        name="revolt",
+        description="Card cares about revolt.",
+        keywords=("Revolt",),
+        should_match=("Fatal Push",),
+        should_not_match=("Lightning Bolt", "Caravan Vigil", "Hunger of the Howlpack"),
+    ),
+    Preset(
+        name="investigate",
+        description="Card creates a Clue (investigate).",
+        keywords=("Investigate",),
+        should_match=("Thraben Inspector",),
+        should_not_match=("Lightning Bolt", "Dragon-Cursed Halls", "Fountainport"),
+    ),
+    Preset(
+        name="landfall",
+        description=(
+            "Card has landfall (whenever a land enters under your control), OR is "
+            "a landfall enabler: casts lands from the graveyard (Crucible of "
+            "Worlds, Ramunap Excavator), grants extra land drops (Exploration, "
+            "Azusa), or returns lands from the graveyard to the battlefield."
+        ),
+        notes=(
+            "The crosswalk `landfall` signal folds the enablers in: OR is a "
+            "landfall ENABLER the crosswalk `landfall` signal folds in: casts a "
+            "land from the graveyard (Crucible of Worlds, Ramunap Excavator), "
+            "grants extra land drops (Exploration, Azusa), or returns lands from "
+            "the graveyard to the battlefield — all read the same 'more land-ETB "
+            "triggers' archetype the old oracle-text regex only caught the "
+            "trigger half of (task #83 structural-view conversion)."
+        ),
+        # Keyword arm UNIONS with the signal_keys view rather than being
+        # subsumed by it: the scoping census found landfall is one of the
+        # mechanics whose keyword-only makers the crosswalk effect lane can
+        # miss (a card whose ONLY landfall tell is the bare Scryfall
+        # `Landfall` array entry, no oracle-text form the lane's structural
+        # reads independently derive). Dropping this arm risks a silent
+        # keyword-only regression the corpus census didn't specifically
+        # rule out; keeping it is a one-line, zero-cost belt-and-suspenders
+        # union — CR 701.19 (Landfall keyword action).
+        keywords=("Landfall",),
+        signal_keys=("landfall",),
+        should_match=("Courser of Kruphix", "Bloodghast"),
+        should_not_match=("Lightning Bolt", "Rampant Growth", "Sakura-Tribe Elder"),
+    ),
+    Preset(
+        name="dredge",
+        description="Card has dredge (BANNED in shared-library format).",
+        keywords=("Dredge",),
+        should_match=("Dakmor Salvage",),
+        should_not_match=("Lightning Bolt", "The Necrobloom", "Stitcher's Supplier"),
+    ),
+    Preset(
+        name="miracle",
+        description="Spell has miracle (BANNED in shared-library format).",
+        keywords=("Miracle",),
+        should_match=("Bonfire of the Damned",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Aminatou, Veil Piercer",
+            "Lorehold, the Historian",
+        ),
+    ),
+    Preset(
+        name="storm",
+        description="Spell has storm.",
+        keywords=("Storm",),
+        should_match=("Flusterstorm",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Storm, Force of Nature",
+            "Crackling Spellslinger",
+        ),
+    ),
+    Preset(
+        name="infect",
+        description=(
+            "Creature has infect — a STATIC ability (CR 702.90a) that modifies how "
+            "its damage is dealt: damage to players becomes poison counters instead "
+            "of life loss (702.90b) and damage to creatures is dealt as -1/-1 "
+            "counters (702.90c). Distinct from Poisonous/Toxic, which add poison "
+            "ON TOP of normal damage and never touch creatures."
+        ),
+        keywords=("Infect",),
+        should_match=("Glistener Elf",),
+        should_not_match=("Lightning Bolt", "Vector Asp", "Melira, Sylvok Outcast"),
+    ),
+    Preset(
+        name="toxic",
+        description="Creature has toxic.",
+        keywords=("Toxic",),
+        should_match=("Bilious Skulldweller",),
+        should_not_match=("Lightning Bolt", "Mite Overseer", "Porcelain Zealot"),
+    ),
+    Preset(
+        name="poison",
+        description=(
+            "Gives a player poison counters: poisonous (CR 702.70a), infect, toxic, "
+            "or a direct poison-counter effect — the poison archetype's makers. "
+            "Caring about poison counters without giving them is not this theme."
+        ),
+        signal_keys=("poison_makers",),
+        should_match=("Marsh Viper", "Blightsteel Colossus", "Virulent Sliver"),
+        should_not_match=("Lightning Bolt", "The Seedcore", "Leeches"),
+    ),
+    Preset(
+        name="delve",
+        description="Spell has delve.",
+        keywords=("Delve",),
+        should_match=("Murderous Cut",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Teval, Arbiter of Virtue",
+            "Banquet Guests",
+        ),
+    ),
+    Preset(
+        name="mill",
+        description=(
+            "Card has the Mill keyword action (puts cards into a "
+            "graveyard from a library). Covers both self-mill and "
+            "targeted mill."
+        ),
+        keywords=("Mill",),
+        should_match=("Stitcher's Supplier",),
+        should_not_match=("Lightning Bolt", "Arid Archway", "Commercial District"),
+    ),
+    Preset(
+        name="suspend",
+        description="Card has suspend.",
+        keywords=("Suspend",),
+        should_match=("Star Whale", "Ancestral Vision"),
+        should_not_match=("Lightning Bolt", "Epochrasite", "Rory Williams"),
+    ),
+    Preset(
+        name="undying",
+        description="Creature has undying.",
+        keywords=("Undying",),
+        should_match=("Young Wolf",),
+        should_not_match=("Lightning Bolt", "Endling", "Mikaeus, the Unhallowed"),
+    ),
+    Preset(
+        name="mutate",
+        description=(
+            "Creature has mutate (CR 702.140a): cast for its mutate cost to merge "
+            "onto a non-Human creature you own, keeping every ability of both."
+        ),
+        keywords=("Mutate",),
+        should_match=("Gemrazer",),
+        should_not_match=("Lightning Bolt", "Pollywog Symbiote", "Zoetic Cavern"),
+    ),
+    # Keyword batch (2026-09-19): the thematic keywords the bulk carries that had no
+    # preset — every description written from the keyword's own defining CR subrule,
+    # or for an ability word (CR 207.2c: no rules meaning of its own) from the
+    # convention its cards share.
+    Preset(
+        name="morph",
+        description=(
+            "Cast face down as a 2/2 creature for {3}, then turned face up any "
+            "time for its morph cost (CR 702.37a); megamorph also puts a +1/+1 "
+            "counter on it as it turns face up (CR 702.37b)."
+        ),
+        keywords=("Morph", "Megamorph"),
+        should_match=("Willbender", "Den Protector"),
+        should_not_match=("Lightning Bolt", "Backslide", "Exiled Doomsayer"),
+    ),
+    Preset(
+        name="disguise",
+        description=(
+            "Cast face down for {3} as a 2/2 creature with ward {2}, then turned "
+            "face up any time for its disguise cost (CR 702.168a)."
+        ),
+        keywords=("Disguise",),
+        should_match=("Alley Assailant",),
+        should_not_match=("Lightning Bolt", "Expose the Culprit", "Zoetic Cavern"),
+    ),
+    Preset(
+        name="bestow",
+        description=(
+            "Creature card that may instead be cast for its bestow cost as an "
+            "Aura (CR 702.103a); it becomes a creature again if it's not "
+            "attached."
+        ),
+        keywords=("Bestow",),
+        should_match=("Hopeful Eidolon",),
+        should_not_match=("Lightning Bolt", "Aboshan's Desire", "Air Bladder"),
+    ),
+    Preset(
+        name="delirium",
+        description=(
+            "Ability word (CR 207.2c): the card does more as long as there are "
+            "four or more card types among cards in your graveyard."
+        ),
+        keywords=("Delirium",),
+        should_match=("Grim Flayer",),
+        should_not_match=("Lightning Bolt", "Barbarian Ring", "Cabal Pit"),
+    ),
+    Preset(
+        name="threshold",
+        description=(
+            "Ability word (CR 207.2c): the card does more as long as there are "
+            "seven or more cards in your graveyard."
+        ),
+        keywords=("Threshold",),
+        should_match=("Werebear",),
+        should_not_match=("Lightning Bolt", "Shifting Woodland", "Crop Sigil"),
+    ),
+    Preset(
+        name="changeling",
+        description=("This card is every creature type (CR 702.73a)."),
+        keywords=("Changeling",),
+        should_match=("Mirror Entity",),
+        should_not_match=("Lightning Bolt", "Belonging", "Abundant Countryside"),
+    ),
+    Preset(
+        name="buyback",
+        description=(
+            "Instant or sorcery that may be cast for an additional buyback cost; "
+            "if it was paid, the spell returns to its owner's hand as it resolves "
+            "instead of going to the graveyard (CR 702.27a)."
+        ),
+        keywords=("Buyback",),
+        should_match=("Capsize",),
+        should_not_match=("Lightning Bolt", "Artful Dodge", "Bump in the Night"),
+    ),
+    Preset(
+        name="devoid",
+        description=("This card is colorless, whatever its mana cost (CR 702.114a)."),
+        keywords=("Devoid",),
+        should_match=("Eldrazi Skyspawner",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Corrupted Crossroads",
+            "Cryptic Trilobite",
+        ),
+    ),
+    Preset(
+        name="daybound",
+        description=(
+            "Double-faced card with daybound on the front face and nightbound on "
+            "the back: it transforms as it becomes night, and transforms back as "
+            "it becomes day (CR 702.145b, 702.145e)."
+        ),
+        keywords=("Daybound", "Nightbound"),
+        should_match=("Arlinn, the Pack's Hope // Arlinn, the Moon's Fury",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Balamb Garden, SeeD Academy // Balamb Garden, Airborne",
+            "Havengul Laboratory // Havengul Mystery",
+        ),
+    ),
+    Preset(
+        name="exert",
+        description=(
+            "Creature you may exert as it attacks for a bonus; an exerted "
+            "permanent doesn't untap during your next untap step (CR 701.43a, "
+            "701.43d)."
+        ),
+        keywords=("Exert",),
+        should_match=("Glorybringer",),
+        should_not_match=("Lightning Bolt", "Cinder Marsh", "Cloudcrest Lake"),
+    ),
+    Preset(
+        name="heroic",
+        description=(
+            "Ability word (CR 207.2c): triggers whenever you cast a spell that "
+            "targets this creature."
+        ),
+        keywords=("Heroic",),
+        should_match=("Phalanx Leader",),
+        should_not_match=("Lightning Bolt", "Monastery Swiftspear", "Soul-Scar Mage"),
+    ),
+    Preset(
+        name="raid",
+        description=(
+            "Ability word (CR 207.2c): the card does more if you attacked this turn."
+        ),
+        keywords=("Raid",),
+        should_match=("Mardu Heart-Piercer",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Michelangelo, the Heart",
+            "Nightsquad Commando",
+        ),
+    ),
+    Preset(
+        name="constellation",
+        description=(
+            "Ability word (CR 207.2c): triggers whenever an enchantment enters "
+            "under your control."
+        ),
+        keywords=("Constellation",),
+        should_match=("Eidolon of Blossoms",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Optimistic Scavenger",
+            "Scrabbling Skullcrab",
+        ),
+    ),
+    Preset(
+        name="metalcraft",
+        description=(
+            "Ability word (CR 207.2c): the card does more as long as you control "
+            "three or more artifacts."
+        ),
+        keywords=("Metalcraft",),
+        should_match=("Galvanic Blast",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Inventors' Fair",
+            "Case of the Filched Falcon",
+        ),
+    ),
+    Preset(
+        name="channel",
+        description=(
+            "Ability word (CR 207.2c): pay a cost and discard this card from your "
+            "hand for an effect, instead of casting it."
+        ),
+        keywords=("Channel",),
+        should_match=("Action News Crew",),
+        should_not_match=("Lightning Bolt", "Ash Barrens", "Barren Moor"),
+    ),
+    Preset(
+        name="bushido",
+        description=(
+            "Bushido N: whenever this creature blocks or becomes blocked, it gets "
+            "+N/+N until end of turn (CR 702.45a)."
+        ),
+        keywords=("Bushido",),
+        should_match=("Konda, Lord of Eiganjo",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Fumiko the Lowblood",
+            "Aisling Leprechaun",
+        ),
+    ),
+    Preset(
+        name="shadow",
+        description=(
+            "Can be blocked only by creatures with shadow, and can block only "
+            "creatures with shadow (CR 702.28b)."
+        ),
+        keywords=("Shadow",),
+        should_match=("Dauthi Voidwalker",),
+        should_not_match=("Lightning Bolt", "Aetherflame Wall", "Heartwood Dryad"),
+    ),
+    Preset(
+        name="landcycling",
+        description=(
+            "Typecycling for a land (CR 702.29e): pay the cost and discard this "
+            "card to search your library for a land card of the named type, such "
+            "as basic landcycling or plainscycling."
+        ),
+        keywords=("Landcycling", "Basic landcycling"),
+        should_match=("Ash Barrens", "Migratory Route"),
+        should_not_match=("Lightning Bolt", "Vedalken Aethermage", "Homing Sliver"),
+    ),
+    Preset(
+        name="craft",
+        description=(
+            "Craft with [materials]: at sorcery speed, exile this permanent plus "
+            "the named materials from among your permanents and graveyard to "
+            "return it to the battlefield transformed (CR 702.167a)."
+        ),
+        keywords=("Craft",),
+        should_match=("Altar of the Wretched // Wretched Bonemass",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Balamb Garden, SeeD Academy // Balamb Garden, Airborne",
+            "Havengul Laboratory // Havengul Mystery",
+        ),
+    ),
+    Preset(
+        name="station",
+        description=(
+            "Tap another untapped creature you control to put charge counters "
+            "equal to its power on this permanent, at sorcery speed (CR "
+            "702.184a); its abilities unlock at counter thresholds (CR 721.2a)."
+        ),
+        keywords=("Station",),
+        should_match=("Adagia, Windswept Bastion",),
+        should_not_match=("Lightning Bolt", "Astral Cornucopia", "Blast Zone"),
+    ),
+    Preset(
+        name="exhaust",
+        description=(
+            "Exhaust — an activated ability that can be activated only once (CR "
+            "702.177a)."
+        ),
+        keywords=("Exhaust",),
+        should_match=("Afterburner Expert",),
+        should_not_match=("Lightning Bolt", "Pit Automaton", "Adrenaline Jockey"),
+    ),
+    Preset(
+        name="persist",
+        description="Creature has persist.",
+        keywords=("Persist",),
+        should_match=("Lesser Masticore",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Dusk Legion Sergeant",
+            "Rhys, the Evermore",
+        ),
+    ),
+    Preset(
+        name="equip",
+        description="Equipment with an equip cost.",
+        keywords=("Equip",),
+        should_match=("Skullclamp", "Helm of the Host"),
+        should_not_match=("Lightning Bolt", "Dan Lewis", "Iron Hills Blacksmith"),
+    ),
+    Preset(
+        name="paradigm",
+        description=(
+            "Spell-copy: exile this spell on resolution. After the first "
+            "spell with this name resolves, you may cast a copy of it "
+            "from exile for free at the beginning of each of your first "
+            "main phases. Recurring free-cast from exile (Secrets of "
+            "Strixhaven)."
+        ),
+        keywords=("Paradigm",),
+        should_match=("Improvisation Capstone",),
+        should_not_match=("Lightning Bolt", "Blossoming Calm", "Distortion Strike"),
+    ),
+    Preset(
+        name="prepared",
+        description=(
+            "Creature paired with a spell on a split face (Secrets of "
+            "Strixhaven 'prepare' layout). The creature becomes prepared "
+            "under a trigger condition (first main phase, attack, etc.). "
+            "While prepared, you may cast the paired spell; doing so "
+            "unprepares the creature. A conditional two-card single-slot "
+            "design, closer in spirit to Adventure than to spell-copy."
+        ),
+        keywords=("Prepared",),
+        layouts=("prepare",),
+        should_match=("Scathing Shadelock // Venomous Words",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Bofur, Reliable Guardian // Concerted Care",
+            "Elusive Otter // Grove's Bounty",
+        ),
+    ),
+    # ── Individual keyword presets (cast-later / graveyard-cast / spell-copy
+    # / tokens / plus-one-counters / misc) ──
+    Preset(
+        name="foretell",
+        description=(
+            "Cast-later: exile from hand for {2}, cast for foretell cost next turn or "
+            "later (CR 702.145)."
+        ),
+        keywords=("Foretell",),
+        should_match=("Scorn Effigy",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Dream Devourer",
+            "Bohn, Beguiling Balladeer",
+        ),
+    ),
+    Preset(
+        name="plot",
+        description=(
+            "Cast-later: exile from hand, cast for its mana cost on a future turn as a "
+            "sorcery (CR 702.167)."
+        ),
+        keywords=("Plot",),
+        should_match=("Djinn of Fool's Fall",),
+        should_not_match=("Lightning Bolt", "Depart the Realm", "Dual Strike"),
+    ),
+    Preset(
+        name="warp",
+        description=(
+            "Cast-later: cast from hand for warp cost, exile at the next end step, "
+            "cast "
+            "again from exile later (CR 702.185)."
+        ),
+        keywords=("Warp",),
+        should_match=("Voidcalled Devotee",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Blade of the Swarm",
+            "Tannuk, Steadfast Second",
+        ),
+    ),
+    Preset(
+        name="rebound",
+        description=(
+            "Cast-later: cast from hand, exile at resolution, cast from exile next "
+            "turn "
+            "(CR 702.88)."
+        ),
+        keywords=("Rebound",),
+        should_match=("Unnatural Summons",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Taigam, Ojutai Master",
+            "Narset Transcendent",
+        ),
+    ),
+    Preset(
+        name="impending",
+        description=(
+            "Cast-later: cast for impending cost; enters as a non-creature enchantment "
+            "with time counters and becomes a creature later (CR 702.182)."
+        ),
+        keywords=("Impending",),
+        should_match=("Lurker in the Deep",),
+        should_not_match=("Lightning Bolt", "Ancestral Vision", "Crashing Footfalls"),
+    ),
+    Preset(
+        name="jump-start",
+        description=(
+            "Graveyard-cast: cast from graveyard by discarding a card in addition to "
+            "other costs (CR 702.133)."
+        ),
+        keywords=("Jump-start",),
+        should_match=("Surge of Acclaim",),
+        should_not_match=("Lightning Bolt", "Niv-Mizzet, Supreme", "Filigree Racer"),
+    ),
+    Preset(
+        name="aftermath",
+        description=(
+            "Graveyard-cast: split card whose second half can only be cast from the "
+            "graveyard (CR 702.127)."
+        ),
+        keywords=("Aftermath",),
+        should_match=("Appeal // Authority",),
+        should_not_match=("Lightning Bolt", "Incendiary", "Goblin Bomb"),
+    ),
+    Preset(
+        name="retrace",
+        description=(
+            "Graveyard-cast: cast from graveyard by discarding a land in addition to "
+            "other costs (CR 702.81)."
+        ),
+        keywords=("Retrace",),
+        should_match=("Oona's Grace",),
+        should_not_match=("Lightning Bolt", "Six", "Deeproot Historian"),
+    ),
+    Preset(
+        name="disturb",
+        description=(
+            "Graveyard-cast: cast a transformed double-faced card from the graveyard "
+            "(CR 702.146)."
+        ),
+        keywords=("Disturb",),
+        should_match=("Baithook Angler // Hook-Haunt Drifter",),
+        should_not_match=("Lightning Bolt", "Shipwreck Sifters", "Phantom Carriage"),
+    ),
+    Preset(
+        name="mayhem",
+        description=(
+            "Graveyard-cast: cast from graveyard for the mayhem cost if discarded this "
+            "turn (CR 702.187)."
+        ),
+        keywords=("Mayhem",),
+        should_match=("Spider-Islanders",),
+        should_not_match=("Lightning Bolt", "Artful Dodge", "Bump in the Night"),
+    ),
+    Preset(
+        name="harmonize",
+        description=(
+            "Graveyard-cast: cast from graveyard for a harmonize cost; tap a creature "
+            "you control to reduce the cost by {1} (CR 702.180)."
+        ),
+        keywords=("Harmonize",),
+        should_match=("Ureni's Counsel",),
+        should_not_match=("Lightning Bolt", "Songcrafter Mage", "Artful Dodge"),
+    ),
+    Preset(
+        name="casualty",
+        description=(
+            "Spell-copy: as you cast, sacrifice a creature with power N or greater to "
+            "copy this spell (CR 702.153)."
+        ),
+        keywords=("Casualty",),
+        should_match=("Cut of the Profits",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Anhelo, the Painter",
+            "Ashad, the Lone Cyberman",
+        ),
+    ),
+    Preset(
+        name="replicate",
+        description=(
+            "Spell-copy: when you cast, pay the replicate cost any number of times to "
+            "create that many copies (CR 702.42)."
+        ),
+        keywords=("Replicate",),
+        should_match=("Train of Thought",),
+        should_not_match=("Lightning Bolt", "Ian Chesterton", "Djinn Illuminatus"),
+    ),
+    Preset(
+        name="cipher",
+        description=(
+            "Spell-copy: encode this spell on a creature you control; whenever that "
+            "creature deals combat damage to a player, you may cast a copy of the "
+            "encoded spell (CR 702.99). Niche Dimir mechanic from Gatecrash."
+        ),
+        keywords=("Cipher",),
+        should_match=("Last Thoughts",),
+        should_not_match=("Lightning Bolt", "Blossoming Calm", "Distortion Strike"),
+    ),
+    Preset(
+        name="conspire",
+        description=(
+            "Spell-copy: tap two untapped creatures sharing a color with this spell to "
+            "copy it (CR 702.75)."
+        ),
+        keywords=("Conspire",),
+        should_match=("Ghastly Discovery",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Rassilon, the War President",
+            "Wort, the Raidmother",
+        ),
+    ),
+    Preset(
+        name="demonstrate",
+        description=(
+            "Spell-copy: when you cast, you may copy it; if you do, choose an opponent "
+            "to copy it too (CR 702.152)."
+        ),
+        keywords=("Demonstrate",),
+        should_match=("Incarnation Technique",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Silverquill Lecturer",
+            "The Twelfth Doctor",
+        ),
+    ),
+    Preset(
+        name="populate",
+        description=(
+            "Tokens: create a copy of a creature token you control (CR 701.36)."
+        ),
+        keywords=("Populate",),
+        should_match=("Wake the Reflections",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Adagia, Windswept Bastion",
+            "Lazotep Quarry",
+        ),
+    ),
+    Preset(
+        name="amass",
+        description=(
+            "Tokens: create a Zombie Army creature token or grow the one you have with "
+            "+1/+1 counters (CR 701.47)."
+        ),
+        keywords=("Amass",),
+        should_match=("Gríma Wormtongue",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Cradle of the Accursed",
+            "Dunes of the Dead",
+        ),
+    ),
+    Preset(
+        name="offspring",
+        description=(
+            "Tokens: pay extra as you cast a creature to create a 1/1 token copy of it "
+            "when it enters (CR 702.175)."
+        ),
+        keywords=("Offspring",),
+        should_match=("Fountainport Charmer",),
+        should_not_match=("Lightning Bolt", "Zinnia, Valley's Voice", "Full Flowering"),
+    ),
+    Preset(
+        name="manifest",
+        description=(
+            "Tokens: put a card face down onto the battlefield as a 2/2 creature (CR "
+            "701.40)."
+        ),
+        keywords=("Manifest",),
+        should_match=("Paranormal Analyst",),
+        should_not_match=("Lightning Bolt", "Zoetic Cavern", "Birchlore Rangers"),
+    ),
+    Preset(
+        name="cloak",
+        description=(
+            "Tokens: manifest with ward {2} — a 2/2 face-down creature with ward {2} "
+            "(CR 701.58)."
+        ),
+        keywords=("Cloak",),
+        should_match=("Ransom Note",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Omarthis, Ghostfire Initiate",
+            "Qarsi High Priest",
+        ),
+    ),
+    Preset(
+        name="incubate",
+        description=(
+            "Tokens: create an Incubator token that transforms into a 3/3 colorless "
+            "Phyrexian when 2+ +1/+1 counters are on it (CR 701.53)."
+        ),
+        keywords=("Incubate",),
+        should_match=("Eyes of Gitaxias",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Marionette Apprentice",
+            "Glint-Sleeve Artisan",
+        ),
+    ),
+    Preset(
+        name="fabricate",
+        description=(
+            "Tokens and +1/+1 counters: when this creature enters, choose to create N "
+            "1/1 Servo tokens OR put N +1/+1 counters on it (CR 702.123)."
+        ),
+        keywords=("Fabricate",),
+        should_match=("Accomplished Automaton",),
+        should_not_match=("Lightning Bolt", "Ichor Drinker", "Progenitor Exarch"),
+    ),
+    Preset(
+        name="afterlife",
+        description=(
+            "Tokens: when this creature dies, create N 1/1 white-and-black Spirit "
+            "tokens with flying (CR 702.135)."
+        ),
+        keywords=("Afterlife",),
+        should_match=("Debtors' Transport",),
+        should_not_match=("Lightning Bolt", "Afterlife Insurance", "Lesser Masticore"),
+    ),
+    Preset(
+        name="mobilize",
+        description=(
+            "Tokens: whenever this creature attacks, create N tapped-and-attacking red "
+            "Warrior tokens that are sacrificed at end of combat (CR 702.181)."
+        ),
+        keywords=("Mobilize",),
+        should_match=("Dalkovan Outrider",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Infantry Shield",
+            "Wyrm's Crossing Patrol",
+        ),
+    ),
+    Preset(
+        name="encore",
+        description=(
+            "Tokens: pay the encore cost and exile this creature from your graveyard "
+            "to "
+            "create a token copy of it for each opponent, each attacking that opponent "
+            "(CR 702.141)."
+        ),
+        keywords=("Encore",),
+        should_match=("Broodmate Tyrant",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Araumi of the Dead Tide",
+            "Graywater's Fixer",
+        ),
+    ),
+    Preset(
+        name="myriad",
+        description=(
+            "Tokens: whenever this creature attacks, for each other opponent, create a "
+            "tapped-and-attacking token copy attacking that opponent (CR 702.116)."
+        ),
+        keywords=("Myriad",),
+        should_match=("The Master, Multiplied",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Ironwill Forger",
+            "Muddle, the Ever-Changing",
+        ),
+    ),
+    Preset(
+        name="bolster",
+        description=(
+            "+1/+1 counters: choose a creature you control with the least toughness "
+            "and "
+            "put N +1/+1 counters on it (CR 701.39)."
+        ),
+        keywords=("Bolster",),
+        should_match=("Dromoka's Gift",),
+        should_not_match=("Lightning Bolt", "Blitzball Stadium", "The Crowd Goes Wild"),
+    ),
+    Preset(
+        name="reinforce",
+        description=(
+            "+1/+1 counters: pay reinforce cost and discard this card to put N +1/+1 "
+            "counters on target creature (CR 702.77)."
+        ),
+        keywords=("Reinforce",),
+        should_match=("Burrenton Bombardier",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Abzan Advantage",
+            "Anafenza, Kin-Tree Spirit",
+        ),
+    ),
+    Preset(
+        name="monstrosity",
+        description=(
+            "+1/+1 counters: pay an activated cost to put N +1/+1 counters on this "
+            "creature and make it monstrous (CR 701.37)."
+        ),
+        keywords=("Monstrosity",),
+        should_match=("Gluttonous Cyclops",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Benthic Biomancer",
+            "Etherium Pteramander",
+        ),
+    ),
+    Preset(
+        name="graft",
+        description=(
+            "+1/+1 counters: enters with N +1/+1 counters on it; may move one counter "
+            "to another creature entering the battlefield (CR 702.58)."
+        ),
+        keywords=("Graft",),
+        should_match=("Simic Initiate",),
+        should_not_match=("Lightning Bolt", "Power Depot", "Arcbound Javelineer"),
+    ),
+    Preset(
+        name="outlast",
+        description=(
+            "+1/+1 counters: sorcery-speed activated ability that puts a +1/+1 counter "
+            "on this creature (CR 702.107)."
+        ),
+        keywords=("Outlast",),
+        should_match=("Disowned Ancestor",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Benthic Biomancer",
+            "Etherium Pteramander",
+        ),
+    ),
+    Preset(
+        name="renown",
+        description=(
+            "+1/+1 counters: when this creature deals combat damage to a player for "
+            "the "
+            "first time, becomes renowned with N +1/+1 counters (CR 702.112)."
+        ),
+        keywords=("Renown",),
+        should_match=("Knight of the Pilgrim's Road",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Aragorn, Hornburg Hero",
+            "Hopeful Initiate",
+        ),
+    ),
+    Preset(
+        name="evolve",
+        description=(
+            "+1/+1 counters: whenever a creature with greater power OR toughness "
+            "enters "
+            "under your control, put a +1/+1 counter on this creature (CR 702.100)."
+        ),
+        keywords=("Evolve",),
+        should_match=("Adaptive Snapjaw",),
+        should_not_match=("Lightning Bolt", "Propagator Drone", "Llanowar Reborn"),
+    ),
+    Preset(
+        name="adapt",
+        description=(
+            "+1/+1 counters: pay adapt cost to put N +1/+1 counters on this creature "
+            "if "
+            "it has no +1/+1 counters (CR 701.46)."
+        ),
+        keywords=("Adapt",),
+        should_match=("Skitter Eel",),
+        should_not_match=("Lightning Bolt", "Fleecemane Lion", "Sinuous Vermin"),
+    ),
+    Preset(
+        name="modular",
+        description=(
+            "+1/+1 counters: artifact creature enters with N +1/+1 counters; when it "
+            "dies, may move them to another artifact creature (CR 702.43)."
+        ),
+        keywords=("Modular",),
+        should_match=("Arcbound Worker",),
+        should_not_match=("Lightning Bolt", "Llanowar Reborn", "Simic Initiate"),
+    ),
+    Preset(
+        name="training",
+        description=(
+            "+1/+1 counters: whenever this creature and at least one other creature "
+            "with greater power attack, put a +1/+1 counter on this creature (CR "
+            "702.149)."
+        ),
+        keywords=("Training",),
+        should_match=("Apprentice Sharpshooter",),
+        should_not_match=("Lightning Bolt", "Elder Arthur Maxson", "Warrior's Resolve"),
+    ),
+    Preset(
+        name="support",
+        description=(
+            "+1/+1 counters: put a +1/+1 counter on each of up to N target creatures "
+            "(CR 701.41)."
+        ),
+        keywords=("Support",),
+        should_match=("Lead by Example",),
+        should_not_match=("Lightning Bolt", "Guy in the Chair", "The Golden Throne"),
+    ),
+    Preset(
+        name="tribute",
+        description=(
+            "+1/+1 counters: an opponent chooses whether this creature enters with N "
+            "+1/+1 counters or instead triggers an additional ability (CR 702.104)."
+        ),
+        keywords=("Tribute",),
+        should_match=("Snake of the Golden Grove",),
+        should_not_match=("Lightning Bolt", "Feasting Hobbit", "Gluttonous Slime"),
+    ),
+    Preset(
+        name="endure",
+        description=(
+            "+1/+1 counters OR tokens: modal — choose to put N +1/+1 counters on a "
+            "creature or create an N/N Spirit token (CR 702.62)."
+        ),
+        keywords=("Endure",),
+        should_match=("Amber-Plate Ainok",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Abzan Advantage",
+            "Anafenza, Kin-Tree Spirit",
+        ),
+    ),
+    Preset(
+        name="devour",
+        description=(
+            "+1/+1 counters: as this creature enters, you may sacrifice any number of "
+            "creatures; it enters with N +1/+1 counters per creature sacrificed this "
+            "way (CR 702.82)."
+        ),
+        keywords=("Devour",),
+        should_match=("Gorger Wurm",),
+        should_not_match=("Lightning Bolt", "Dragon Broodmother", "Sidisi's Faithful"),
+    ),
+    Preset(
+        name="dethrone",
+        description=(
+            "+1/+1 counters: whenever this creature attacks the player with the most "
+            "life, put a +1/+1 counter on it (CR 702.105)."
+        ),
+        keywords=("Dethrone",),
+        should_match=("Enraged Revolutionary",),
+        should_not_match=("Lightning Bolt", "Dack's Duplicate", "Cathedral of War"),
+    ),
+    Preset(
+        name="earthbend",
+        description=(
+            "Land animation: turn a target land you control into a 0/0 creature with "
+            "haste and put N +1/+1 counters on it. When that land dies or is exiled, "
+            "return it tapped (CR 701.66)."
+        ),
+        keywords=("Earthbend",),
+        should_match=("Toph, Greatest Earthbender",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Mutavault",
+            "Airbender Ascension",
+            "Airbender's Reversal",
+            "Airbending Lesson",
+        ),
+    ),
+    Preset(
+        name="wither",
+        description=(
+            "Creature damage: whenever this creature deals damage to a creature, that "
+            "damage is dealt as -1/-1 counters instead (CR 702.80)."
+        ),
+        keywords=("Wither",),
+        should_match=("Harvest Gwyllion",),
+        should_not_match=("Lightning Bolt", "Fang Skulkin", "Woodlurker Mimic"),
+    ),
+    Preset(
+        name="unearth",
+        description=(
+            "Reanimate: pay unearth cost to return this card from your graveyard to "
+            "the "
+            "battlefield with haste; exile it at the beginning of the next end step "
+            "(CR "
+            "702.84)."
+        ),
+        keywords=("Unearth",),
+        should_match=("Gixian Recycler",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Mishra, Tamer of Mak Fawa",
+            "Solemn Doomguide",
+        ),
+    ),
+    Preset(
+        name="exploit",
+        description=(
+            "Sacrifice trigger: when this creature enters, you may sacrifice a "
+            "creature "
+            "for an additional effect (CR 702.110)."
+        ),
+        keywords=("Exploit",),
+        should_match=("Sidisi's Faithful",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Henry Wu, InGen Geneticist",
+            "Feasting Hobbit",
+        ),
+    ),
+    # crew/prototype/firebending are defined as standalone presets in
+    # _FUNCTIONAL_PRESETS below (with richer descriptions + layout support).
+)
+
+# ─── Functional regex presets ─────────────────────────────────────────────
+# Themes without a matching keyword ability. Each pattern is tested against
+# the should_match / should_not_match fixtures in the test suite.
+
+_FUNCTIONAL_PRESETS: tuple[Preset, ...] = (
+    # Top-of-library manipulation: scry + surveil keywords, plus "look/reveal/
+    # exile the top" non-keyword phrasings. Handles both singular ("the top
+    # card") and plural ("the top four cards") forms.
+    # Structural view (task #83): signal key `topdeck_selection` — OWN-
+    # library top curation (CR 701.22a scry / 701.25a surveil / 701.20a
+    # reveal / 701.13a exile / 701.17 mill / 401.5 look-at-top statics). See
+    # `_analysis.lanes._topdeck_selection` — already unions in
+    # most of the old regex's territory via typed Dig/RevealTop/ExileTop/
+    # MayLookAtTopOfLibrary reads, plus the "reveal from the top until you
+    # find X" dig-until idiom the old regex never phrase-matched (a genuine
+    # gain: Abundant Harvest, Ajani's +1). `keywords=("Scry", "Surveil")`
+    # stays as a belt-and-suspenders union (the landfall precedent):
+    # verified via a live investigation that a CONDITIONAL scry rider
+    # (Bane's Contingency — "if that spell targets a commander you control,
+    # instead counter that spell, scry 2, then draw a card") carries `Scry`
+    # in its Scryfall keyword array but produces no typed Scry node in
+    # phase's parse of the modal branch, so the structural arm alone misses
+    # it — the raw keyword-array fact recovers it at zero cost. Residue
+    # (scoping census, ~179 preset-only / ~208 candidate-only over the
+    # corpus): preset-only is dominated by opponent-DIRECTED top effects
+    # ("exile the top three cards of TARGET OPPONENT's library" — Ashiok,
+    # Nightmare Weaver — routes to the disjoint `opp_top_exile` lane, not
+    # your-own-library curation) and symmetric "look at the top of TARGET
+    # PLAYER's library" riders on cards whose primary archetype lies
+    # elsewhere (Architects of Will routes to `blink_flicker`/
+    # `voltron_matters`); candidate-only is the genuine dig-until gain
+    # above. Scope-noise, not a concept gap — the view's `topdeck_selection`
+    # key is deliberately "YOUR library, top curation" per its own CR
+    # grounding, and opponent-directed exile is correctly a different
+    # archetype.
+    Preset(
+        name="top-manipulation",
+        description=(
+            "Any effect that looks at, reveals, scries, surveils, or "
+            "exiles cards from the top of the library."
+        ),
+        keywords=("Scry", "Surveil"),
+        signal_keys=("topdeck_selection",),
+        should_match=(
+            "Preordain",
+            "Thought Erasure",
+            "Abbot of Keral Keep",
+            "Satyr Wayfinder",
+        ),
+        should_not_match=(
+            "Lightning Bolt",
+            "Llanowar Elves",
+            "Divination",
+            "Sign in Blood",
+        ),
+    ),
+    # Self-mill (task #83 structural-view conversion). No candidate signal
+    # KEY is precise enough on its own: mill_makers is keyword-only with
+    # scope "any" (self OR opponent, undiscriminated); graveyard_makers'
+    # Mill arm bundles self-mill with reanimate/recursion under ONE key
+    # (see graveyard-return's own conversion note below); topdeck_selection
+    # fires unconditionally on any Scry/Surveil node regardless of
+    # destination (would false-match Contingency Plan's reveal-then-
+    # reorder-to-bottom, the preset's own long-standing false-positive
+    # test case). ``self_mill_fill`` (the lanes package) reads the two
+    # precise structural shapes instead: a self-scoped Mill into Graveyard
+    # (Stitcher's Supplier), or a filter ``Dig`` whose ``rest_destination``
+    # is Graveyard (Satyr Wayfinder / Grisly Salvage / Ransack the Lab —
+    # "look at/reveal the top N, put a card to hand, the rest into your
+    # graveyard").
+    Preset(
+        name="self-mill",
+        description=(
+            "Puts cards from YOUR library into YOUR graveyard "
+            "(graveyard-value, not targeted mill)."
+        ),
+        concept=_self_mill_concept,
+        should_match=(
+            "Stitcher's Supplier",
+            "Satyr Wayfinder",
+            "Grisly Salvage",
+            "Ransack the Lab",
+            # Mulch's "reveal top N, put type X to hand, rest to
+            # graveyard" is a THIRD structural shape (reveal_top + a
+            # sibling Graveyard-bound ChangeZone, not a Dig node) —
+            # self_mill_fill's own docstring names it.
+            "Mulch",
+            # task #87 census residue — one representative per shape
+            # class the ``self_mill_fill`` predicate's own docstring
+            # names: a bare Mill buried in a trigger's ``else_ability``
+            # branch, and the Dig/RevealTop "look-then-keep-one" marker
+            # (a draw-replacement Dig — Underrealm Lich; a RevealTop +
+            # Unimplemented-hop chain — Animal Magnetism).
+            "HYDRA Troopers",
+            "Underrealm Lich",
+            "Animal Magnetism",
+            # task #np_gyfam — two more shapes the predicate's own
+            # docstring names: a mis-tagged ``RevealHand`` node (Corpse
+            # Appraiser's "look at the top three... put one into your
+            # hand and the rest into your graveyard" parses as
+            # ``RevealHand``, not ``Dig``/``RevealTop``) and a ``Dig``
+            # whose ``rest_destination`` phase drops entirely rather than
+            # setting it to Graveyard (Rowan's Grim Search).
+            "Corpse Appraiser",
+            "Rowan's Grim Search",
+        ),
+        # Contingency Plan is the canonical false-positive test case —
+        # its oracle reveals top 5 but returns them to the BOTTOM of the
+        # library, never the graveyard (structurally a bare Surveil node
+        # with no rest_destination field at all — see self_mill_fill's
+        # docstring). The task #87 census non-members are all
+        # graveyard-TO-BATTLEFIELD reanimation cards (Dread Wanderer /
+        # Cauldron Dance / Evershrike / Defossilize / Greasefang, Okiba
+        # Boss) or dredge (The Necrobloom) — none fills the graveyard
+        # from the library.
+        should_not_match=(
+            "Lightning Bolt",
+            "Counterspell",
+            "Contingency Plan",
+            "Dread Wanderer",
+            "Cauldron Dance",
+            "Evershrike",
+            "Defossilize",
+            "Greasefang, Okiba Boss",
+            "The Necrobloom",
+        ),
+    ),
+    # Counterspell (task #83 structural-view conversion). ``counter_control``
+    # is the stack counterspell (CR 701.6a): a Counter/CounterAll effect
+    # whose target is a StackSpell (Counterspell, Mana Leak, Remand,
+    # Sinister Sabotage) — see
+    # ``_analysis.lanes._counter_control``. Structurally
+    # DISJOINT from the OTHER meaning of "counter" (+1/+1 counters) and from
+    # "can't be countered" permission statics, so the view carries none of
+    # the old regex's theoretical false-positive surface on those. 10
+    # preset-only residue (scoping census): "counter target activated/
+    # triggered ability" phrasings (Rule of Law-adjacent, Voidslime-style
+    # "counter target activated or triggered ability") — the lane's own
+    # target read is a StackSpell only, so a spell that counters an
+    # ABILITY instead of a SPELL genuinely never fires here; a narrower,
+    # more precise scope than the old "spell|ability" regex alternation,
+    # not a regression (deferred — a lane widen to add an ability-target
+    # arm needs its own corpus-diff + CR-citation bar, out of scope for a
+    # view conversion).
+    Preset(
+        name="counterspell",
+        description="Counters a target spell (CR 701.6a — the stack counterspell).",
+        signal_keys=("counter_control",),
+        should_match=("Counterspell", "Mana Leak", "Remand", "Sinister Sabotage"),
+        should_not_match=(
+            "Lightning Bolt",
+            "Llanowar Elves",
+            "Vexing Shusher",
+            "Abrupt Decay",
+        ),
+    ),
+    # Creature/permanent removal (task #83/#86 structural-view conversion —
+    # the LAST regex-bearing preset). ``signal_keys`` is the 9-key union
+    # scoped by task #83's census (rec 0.81 vs the old intentionally-
+    # generous regex): ``removal`` + ``exile_removal`` + ``mass_removal`` +
+    # ``mass_bounce`` + ``counter_control`` + ``direct_damage`` +
+    # ``bounce_tempo`` + ``fight_makers`` + ``debuff_makers``.
+    #
+    # Two lane gaps the original scoping deferred on are now fixed (task
+    # #85, the lanes package): (1) ``debuff_makers``'s single-target Pump
+    # arm now reads a dynamic ``-X/-X`` (mirroring the mass ``PumpAll``
+    # arm's existing ``_negative_pt_field`` read, CR 704.5f) — Toxic Deluge,
+    # Death Wind, Flunk, Cloudkill and 83 more recover; (2) a "target
+    # [combat-state/color]-qualified creature" Destroy (Smite) that lost its
+    # ``Creature`` type_filter in phase's own typed target node now recovers
+    # via a raw-text bridge gated on total structural silence.
+    #
+    # Real residue the union still misses vs the old regex (fixtures that
+    # FLIP — the old regex matched these, the view doesn't; adjudicated as
+    # MORE-correct routing, not a lane bug, per task #83's scoping pass):
+    #   - Pacifism / Arrest (pacify auras — "enchanted creature can't
+    #     attack"): neutralizes the threat but never destroys/exiles/
+    #     counters/bounces/fights/-X's it, so it's not a removal-FAMILY
+    #     effect by ANY of the 9 keys; routes to ``enchantments_matter``.
+    #
+    # Task #88 CLOSES the two library-tuck gaps this note used to document
+    # (Condemn/Chaos Warp routed to lifegain_makers/toughness_combat and
+    # cheat_from_top/cheat_into_play respectively, with NO removal-family
+    # membership at all — the TUCK-REMOVAL finding: a battlefield permanent
+    # shuffled/put into a library is a removal-family result the `removal`
+    # key never read). ``_removal``'s own tuck arm now covers both — see
+    # its docstring for the target-filter mechanics — so Condemn and Chaos
+    # Warp move from should_not_match to should_match below; Chaos Warp
+    # ALSO still fires cheat_from_top/cheat_into_play for its OWN "reveal
+    # the top card, maybe put it into play" half (both facts are true of
+    # the same card, no conflict).
+    # A prior flip attempt this session hit a SEPARATE problem: three
+    # downstream call sites (``cube_balance._is_removal``, archetype_audit's
+    # CLI preset flag, and the tuner's classify/swaps role checks) exercised
+    # this preset against SYNTHETIC cards with no ``oracle_id`` in their own
+    # unit tests, which a ``signal_keys``-only Preset always fails to match
+    # (see the module docstring's "Structural views" section) — task #86
+    # migrated those 12 tests to real testkit-served cards FIRST (see
+    # ``test_cube_balance.py``, ``test_archetype_audit.py``,
+    # ``test_tuner_classify.py``, ``test_tuner_swaps.py``), so this flip
+    # lands clean.
+    Preset(
+        name="removal",
+        description=(
+            "Creature/permanent removal — destroy/exile/counter/damage/"
+            "bounce/fight/-X effects (intentionally generous)."
+        ),
+        signal_keys=(
+            "removal",
+            "exile_removal",
+            "mass_removal",
+            "mass_bounce",
+            "counter_control",
+            "direct_damage",
+            "bounce_tempo",
+            "fight_makers",
+            "debuff_makers",
+        ),
+        should_match=(
+            "Murder",  # bare `removal` key
+            "Swords to Plowshares",  # exile_removal
+            "Wrath of God",  # mass_removal
+            "Evacuation",  # mass_bounce
+            "Counterspell",  # counter_control
+            "Lightning Bolt",  # direct_damage
+            "Boomerang",  # bounce_tempo
+            "Prey Upon",  # fight_makers
+            "Disfigure",  # debuff_makers
+            "Toxic Deluge",  # debuff_makers + mass_removal (dynamic -X/-X)
+            "Condemn",  # removal — single-target tuck (task #88)
+            "Chaos Warp",  # removal — single-target tuck, any permanent
+        ),
+        should_not_match=(
+            "Llanowar Elves",
+            "Command Tower",
+            "Lupine Prototype",
+            "Pacifism",  # pacify aura -> enchantments_matter, not removal
+        ),
+    ),
+    # Pacify aura (task #87): the dedicated structural concept the
+    # `removal` preset's own should_not_match note (and roles.py's
+    # `_INTERACTION_PRESETS` comment) named as the recovery path for
+    # Pacifism/Arrest's `interaction`-role credit — never folded back into
+    # `removal` itself (CR 611.2: the enchanted permanent stays on the
+    # battlefield, so it's a genuinely different fact than
+    # destroy/exile/counter/bounce/fight/-X). See
+    # ``lanes._pacify_makers``'s own docstring for the
+    # structural read (a `CantAttack`/`CantBlock`/`CantAttackOrBlock`
+    # static whose ``affected`` filter is `EnchantedBy` — "whatever this
+    # enchants").
+    Preset(
+        name="pacify-aura",
+        description=(
+            "An Aura that neutralizes the creature/permanent it enchants "
+            "(can't attack/block) rather than destroying, exiling, "
+            "countering, bouncing, fighting, or -X/-X'ing it — Pacifism, "
+            "Arrest (CR 508.1a/509.1b)."
+        ),
+        signal_keys=("pacify_makers",),
+        should_match=("Pacifism", "Arrest", "Faith's Fetters", "Prison Term"),
+        should_not_match=("Lightning Bolt", "Counterspell", "Murder"),
+    ),
+    # Board wipe — subset of removal that hits all/many creatures.
+    Preset(
+        name="board-wipe",
+        description=(
+            "Destroys or damages all creatures (board-wide removal): symmetric "
+            "sweeps, including mass tuck (Terminus, Hallowed Burial). A one-sided "
+            "shrink of only your opponents' creatures (Massacre Wurm, Cower in "
+            "Fear) is a punisher, not a wipe."
+        ),
+        notes=(
+            "task #83 structural-view conversion: signal keys `mass_removal` "
+            "(DestroyAll / mass-exile / DamageAll / a SYMMETRIC "
+            "negative-toughness PumpAll, FIXED or dynamic-X — CR 115.10 / 701.8 / "
+            "701.21a / 406.1 — plus a ChooseAndSacrificeRest sweep, Tragic "
+            "Arrogance/Cataclysm) + `symmetric_damage_each` "
+            "(DamageAll/DamageEachPlayer, the burn-side twin). mass_removal "
+            "deliberately EXCLUDES an opponent-scoped one-sided shrink (Massacre "
+            "Wurm, Cower in Fear: 'creatures your opponents control get -N/-N') — "
+            "a real deck-building distinction between a SYMMETRIC sweep and a "
+            "one-sided punisher (adjudicated, not a gap; see `_mass_removal`'s "
+            "own docstring) — so Massacre Wurm moves to should_not_match here. "
+            "Recall 0.86 vs the old regex; the large majority of the 75 "
+            "preset-only cards are this same one-sided-debuff family (Doomwake "
+            "Giant, Elesh Norn, Ethereal Absolution, ...) plus graveyard-hate "
+            "mass-exile ('exile all creature cards from a graveyard' — Crypt "
+            "Incursion, Honor the Fallen — a different mechanic, not a "
+            "battlefield wipe), both correct sheds. DEFERRED narrow residual (not "
+            "fixed here — a lane change, out of scope for a view conversion): 6 "
+            "symmetric 'All creatures get -X/-X' wipes whose X is a COMPUTED "
+            "value (Cloudkill: negative of a commander's mana value; also Deluge "
+            "of Doom, Planar Despair, Kagemaro First to Suffer, Ichor Explosion, "
+            "Terisiare's Devastation) carry the toughness reduction as a "
+            "`Quantity`/`Multiply(factor=-1, ...)` node, not the `Variable('-X')` "
+            "shape `_negative_pt_field` reads (the Toxic Deluge dynamic-X fix, "
+            "ADR-0035 task #83 chunk-A) — that helper's own docstring assumed 'no "
+            "corpus mass-debuff representative' for the Quantity shape, which "
+            "this residue corrects. 6 cards of 543 (recall 0.989) — the view is "
+            "still correct to ship; these are the residual tail. Task #88 adds a "
+            "mass TUCK arm to `mass_removal` (ChangeZoneAll -> Library, the SAME "
+            "first-class mass tag, a different zone-change verb — CR 401.4) — "
+            "Terminus/Hallowed Burial ('put all creatures on the bottom of their "
+            "owners' libraries') were ZERO-signal before this and are now "
+            "board-wipe members, Terminus pinned below."
+        ),
+        signal_keys=("mass_removal", "symmetric_damage_each"),
+        should_match=(
+            "Wrath of God",
+            "Farewell",
+            "Drown in Sorrow",
+            "Tragic Arrogance",
+            "Toxic Deluge",
+            "Crux of Fate",
+            "Culling Ritual",
+            "Terminus",  # mass tuck (ChangeZoneAll -> Library, task #88)
+        ),
+        should_not_match=(
+            "Lightning Bolt",
+            "Swords to Plowshares",
+            "Ivory Charm",
+            "Massacre Wurm",
+        ),
+    ),
+    # ── Type-specific removal ──
+    #
+    # These are strict: they match cards that NAME the target type (or its
+    # umbrellas like "creature or planeswalker"). Cards with universal
+    # "destroy target permanent" phrasing (Vindicate, Beast Within) appear
+    # only in `universal-removal`; count both presets to get the full set
+    # of cards that can answer a given type.
+    #
+    # All patterns use [^.]* to stay within a single sentence, avoiding
+    # false-positives like Beast Within where "creature token" appears
+    # AFTER the destroy clause.
+    #
+    # Overlap warning: presets deliberately overlap where cards can answer
+    # multiple types — e.g. Lightning Bolt matches both `creature-removal`
+    # and `planeswalker-removal` via "any target" burn, and Hero's
+    # Downfall matches both via "creature or planeswalker". This is
+    # correct (Bolt CAN kill either) but callers summing counts across
+    # presets will double-count these cards. Use set-union semantics on
+    # the `cards` list in each theme's audit result if you need
+    # deduplicated totals.
+    # ── Task #83 structural views: the target's PERMANENT CORE TYPE (CR
+    # 109.3) is a fact the production signal lanes don't carry as a
+    # ``Signal.subject`` (``removal``/``exile_removal``/``mass_removal``/
+    # ``edict_makers`` all emit ``subject=""``). Each preset below is a
+    # ``concept`` predicate bound to one core type via
+    # ``_removal_edict_concept`` (see that function + ``lanes.
+    # removal_edict_targets_type``'s docstrings for the target-filter
+    # mechanics they reuse) — no regex, no ``signal_keys`` (Preset ORs
+    # every arm; the AND between "is removal/edict" and "targets THIS type"
+    # lives entirely inside the concept predicate's own tree walk).
+    Preset(
+        name="creature-removal",
+        description=(
+            "Single-target OR mass creature removal: destroy/exile "
+            "targeting Creature, damage-to-creature (including 'any "
+            "target' burn — generous, matches the legacy preset), fight, "
+            "and a P/T shrink (fixed or dynamic -X/-X)."
+        ),
+        keywords=("Fight", "Infect", "Wither"),
+        concept=_removal_edict_concept("Creature", generous_any=True),
+        should_match=(
+            "Swords to Plowshares",
+            "Doom Blade",
+            "Lightning Bolt",
+            "Hero's Downfall",
+            "Toxic Deluge",
+            "Prey Upon",  # fight branch
+            "Electrolyze",  # divided-damage / any-target branch
+            "Disfigure",  # -N/-N branch
+        ),
+        should_not_match=(
+            "Counterspell",  # counters a spell, doesn't remove a creature
+            "Llanowar Elves",
+            "Beast Within",  # universal-removal, not creature-specific
+            "Shatter",  # artifact-specific
+        ),
+    ),
+    Preset(
+        name="artifact-removal",
+        description=(
+            "Single-target OR mass artifact removal: destroy/exile "
+            "targeting Artifact (including 'target artifact or "
+            "enchantment' bridge spells)."
+        ),
+        concept=_removal_edict_concept("Artifact"),
+        should_match=("Shatter", "Disenchant", "Reclamation Sage"),
+        should_not_match=("Lightning Bolt", "Wrath of God", "Sinkhole"),
+    ),
+    Preset(
+        name="enchantment-removal",
+        description=(
+            "Single-target OR mass enchantment removal: destroy/exile "
+            "targeting Enchantment (including 'target artifact or "
+            "enchantment')."
+        ),
+        concept=_removal_edict_concept("Enchantment"),
+        should_match=("Disenchant", "Reclamation Sage"),
+        should_not_match=("Lightning Bolt", "Shatter", "Sinkhole"),
+    ),
+    Preset(
+        name="land-removal",
+        description=(
+            "Land destruction, single-target or mass (MLD). Includes Sinkhole, "
+            "Strip Mine, Wasteland, Armageddon, and repeatable land-destruction "
+            "engines (Numot, Goblin Settler)."
+        ),
+        notes=(
+            "Unions the ``land_destruction`` REPEATABLE-LD-ENGINE membership "
+            "floor (a creature-commander cross-open the target-type walk below "
+            "can't see — Numot, Goblin Settler) with a target-type walk over "
+            "destroy/exile effects (the ``removal``/``mass_removal`` lanes "
+            "deliberately EXCLUDE Land, routing it here instead — see "
+            "``_removal``'s docstring)."
+        ),
+        signal_keys=("land_destruction",),
+        concept=_removal_edict_concept("Land"),
+        should_match=("Sinkhole", "Strip Mine", "Wasteland", "Armageddon"),
+        should_not_match=("Lightning Bolt", "Doom Blade", "Wrath of God"),
+    ),
+    Preset(
+        name="mass-land-denial",
+        description=(
+            "Mass land denial as the Commander Brackets define it: destroy, exile "
+            "or bounce lands, keep them tapped, or change their mana, four or more "
+            "per player and without replacing them (Armageddon, Wildfire, Winter "
+            "Orb, Blood Moon). Disallowed below bracket 4."
+        ),
+        notes=(
+            "Structural view: signal key `mass_land_denial` "
+            "(`crosswalk.reads.mass_land_denial`, ADR-0030). One-land edicts "
+            "(Yawning Fissure) and replaced lands (From the Ashes) are not."
+        ),
+        signal_keys=("mass_land_denial",),
+        should_match=("Armageddon", "Winter Orb", "Blood Moon", "Wildfire"),
+        should_not_match=("Strip Mine", "Yawning Fissure", "From the Ashes"),
+    ),
+    Preset(
+        name="board-protection",
+        description=(
+            "Gives hexproof, shroud, indestructible, ward, protection or umbra "
+            "armor to your other permanents or to you, or saves them — "
+            "regeneration, phasing out, damage prevention."
+        ),
+        notes=(
+            "Structural view: signal key `board_protection` "
+            "(`crosswalk.protection.protective_grant_recipients` / "
+            "`protective_saves`; umbra armor also from the keyword array). The "
+            "narrower half of `protects-board`, which `roles.protects` reads; a "
+            "counterspell or a pillowfort is protection but not this key."
+        ),
+        signal_keys=("board_protection",),
+        should_match=(
+            "Avacyn, Angel of Hope",
+            "Darksteel Forge",
+            "Leyline of Sanctity",
+            "Heroic Intervention",
+            "Swiftfoot Boots",
+            "Fog",
+            "Hyena Umbra",
+        ),
+        should_not_match=(
+            "Dragonlord Ojutai",
+            "Temporal Isolation",
+            "Counterspell",
+            "Ghostly Prison",
+            "Lightning Bolt",
+        ),
+    ),
+    Preset(
+        name="protects-board",
+        description=(
+            "Protects your board or you: grants hexproof, shroud, indestructible, "
+            "ward or protection to your other permanents or to you, saves them "
+            "(regeneration, phasing out, damage prevention), keeps attackers off "
+            "you, or answers removal on the stack (counterspells, redirects)."
+        ),
+        notes=(
+            "Structural view: `roles.protects` (ADR-0051) and the tuner's "
+            "protection sourcing read this one preset. Keys `board_protection` "
+            "(the `board-protection` preset's key), `pillowfort` "
+            "(`crosswalk.protection.attack_deterrent`), `counter_control`, "
+            "`spell_redirect` (stack redirects of spells and abilities, and spell "
+            "thieves). A "
+            "card that protects only itself (Dragonlord Ojutai) and a pacifying "
+            "prevention Aura (Temporal Isolation) are not members."
+        ),
+        signal_keys=(
+            "board_protection",
+            "pillowfort",
+            "counter_control",
+            "spell_redirect",
+        ),
+        should_match=(
+            "Avacyn, Angel of Hope",
+            "Darksteel Forge",
+            "Leyline of Sanctity",
+            "Heroic Intervention",
+            "Swiftfoot Boots",
+            "Ghostly Prison",
+            "Counterspell",
+            "Misdirection",
+            "Hyena Umbra",
+            "Fog",
+        ),
+        should_not_match=(
+            "Dragonlord Ojutai",
+            "Fleecemane Lion",
+            "Temporal Isolation",
+            "Thrun, the Last Troll",
+            "Oubliette",
+            "Twincast",
+            "Lightning Bolt",
+        ),
+    ),
+    Preset(
+        name="pillowfort",
+        description=(
+            "Keeps creatures from attacking you: attack taxes (Ghostly Prison, "
+            "Propaganda), attack bans (the Vow cycle) and attack limits "
+            "(Crawlspace, Silent Arbiter)."
+        ),
+        notes=(
+            "Structural view: signal key `pillowfort` "
+            "(`crosswalk.protection.attack_deterrent`). A restriction on one "
+            "creature's "
+            "attacks with no defender named (Pacifism) and a limit on attacking "
+            "the card itself (The Eternal Wanderer) are not."
+        ),
+        signal_keys=("pillowfort",),
+        should_match=(
+            "Ghostly Prison",
+            "Propaganda",
+            "Crawlspace",
+            "Silent Arbiter",
+            "Vow of Duty",
+        ),
+        should_not_match=("Pacifism", "The Eternal Wanderer", "Lightning Bolt"),
+    ),
+    Preset(
+        name="planeswalker-removal",
+        description=(
+            "Single-target OR mass planeswalker removal: destroy/exile "
+            "targeting Planeswalker, damage-to-planeswalker (including "
+            "'any target' burn — generous, matches the legacy preset)."
+        ),
+        concept=_removal_edict_concept("Planeswalker", generous_any=True),
+        should_match=("Hero's Downfall", "Lightning Bolt"),
+        should_not_match=("Counterspell", "Shatter"),
+    ),
+    Preset(
+        name="universal-removal",
+        description=(
+            "Destroys or exiles any permanent regardless of type: a "
+            "target/sacrifice filter whose bare core-type word is the "
+            "literal 'Permanent' (Vindicate, Beast Within, Nicol Bolas, "
+            "Planeswalker's +3). Cards here are in addition to the "
+            "type-specific presets — check both for full coverage of a "
+            "given permanent type."
+        ),
+        concept=_removal_edict_concept("Permanent"),
+        should_match=(
+            "Vindicate",
+            "Beast Within",
+            "Maelstrom Pulse",
+            "Nicol Bolas, Planeswalker",
+        ),
+        should_not_match=(
+            "Lightning Bolt",
+            "Swords to Plowshares",  # creature-only
+            "Shatter",  # artifact-only
+            "Wrath of God",  # mass, not single-target universal
+        ),
+    ),
+    # Bounce — return target creature/permanent to hand.
+    Preset(
+        name="bounce",
+        description=(
+            "Returns a target creature, nonland permanent, or permanent to its "
+            "owner's hand (CR 402.1) — tempo bounce. Returning your own permanent "
+            "to protect it, or a card from a graveyard to hand, is not this "
+            "theme."
+        ),
+        notes=(
+            "task #83 structural-view conversion: signal keys `bounce_tempo` "
+            "(single-target battlefield->hand, self-bounce/GY-recall vetoed — CR "
+            "402.1 vs 404.1) + `mass_bounce` (board-wide). Recall 0.87 vs the old "
+            "regex; 30 preset-only, near all a deliberate self-bounce ('return "
+            "target permanent YOU CONTROL' — a protection idiom, not tempo) or "
+            "GY-card-recursion ('return target ... CARD from a graveyard') the "
+            "old regex's own comment already meant to exclude but its negative "
+            "lookahead missed on 'creature OR land card' phrasings (Awaken the "
+            "Honored Dead). DEFERRED narrow residual (not fixed here — a lane "
+            "change, out of scope for a view conversion): Aether Helix's genuine "
+            "'return target permanent to hand' tempo bounce is wrongly GY-veto'd "
+            "because its sibling graveyard-return effect tags as `change_zone`, "
+            "not `bounce` — the veto's `len(bounces) == 1` guard "
+            "(`_analysis/tree_synthesis/mana_ramp_lands.py::_arm_bounce_tempo`) "
+            "treats the ONE `bounce`-tagged node as if it were the unit's sole "
+            "(self-referential) GY return, when it's really the OTHER sentence's "
+            "untagged pair; Alchemist's Retrieval's Cleave alternate mode (which "
+            "drops the '[you control]' restriction) isn't modeled separately, so "
+            "its base parse reads as a vetoed self-bounce; Whirlpool Whelm's "
+            "Clash-then-bounce composite gets no `bounce` concept node at all; "
+            "Banishing Knack / Retraction Helix grant another creature a "
+            "bounce-activated ability ('target creature gains \"{T}: Return...\"') "
+            "and the granted ability's effect isn't walked (the same "
+            "GrantAbility-descent gap the sacrifice-outlet conversion's Rakdos "
+            "Riteknife note names). 5 cards of 231 (recall 0.978) — the view is "
+            "still correct to ship; these are the residual tail."
+        ),
+        signal_keys=("bounce_tempo", "mass_bounce"),
+        should_match=("Unsummon", "Boomerang"),
+        should_not_match=("Lightning Bolt", "Unnatural Restoration"),
+    ),
+    # Targeted discard — opponent discards card(s) (task #83 structural-view
+    # conversion). Union of `opponent_discard` (CR 701.9 — a forced
+    # OPPONENT discard, direction read off the discard effect's OWN
+    # recipient: targeted/opponent player or a symmetric each-player wheel)
+    # and `hand_disruption` (CR 402.3 — the Thoughtseize-style reveal-and-
+    # choose family: reveal the opponent's hand, then discard a chosen
+    # card). See `_analysis.lanes._opponent_discard` /
+    # `._hand_disruption`. 2 preset-only residue (scoping census): Collective
+    # Defiance / Steal the Show ("Target player discards all/any number of
+    # cards, then draws that many cards") — the old regex fired on the bare
+    # word "discards", but the card's actual effect is a symmetric hand
+    # FILTER for a targeted player (rummage — you can target yourself too,
+    # net card count unchanged), not a punisher-style forced-discard hand
+    # attack; the crosswalk correctly routes it to `card_draw_engine` /
+    # `target_player_draws` instead — a regex-over-catch shed, signals are
+    # more correct here.
+    Preset(
+        name="discard",
+        description="Forces a target player or opponent to discard cards.",
+        signal_keys=("opponent_discard", "hand_disruption"),
+        should_match=("Thoughtseize", "Hymn to Tourach"),
+        should_not_match=("Lightning Bolt", "Faithless Looting", "Careful Study"),
+    ),
+    # Tutors — search your library for a card (task #83 structural-view
+    # conversion). Signal key `tutor` (CR 701.23/701.23a — your-library
+    # search). lf_ramp (2026-07-13 convention change): `tutor` EXCLUDES
+    # land-fetch-to-battlefield ramp (Sakura-Tribe Elder, Cultivate now fire
+    # `ramp` instead — the template's ramp convention, read by the `ramp`
+    # preset / `_analysis.roles.is_ramp`), so
+    # those two flipped to should_not_match; a land fetch TO HAND (Sylvan
+    # Scrying) stays a genuine tutor and pins that side of the boundary.
+    # See `_analysis.lanes._tutor_lane` — the lane
+    # has an ADJUDICATED VETO (ADR-0037, `synth_tutor_directed`) for a
+    # directed/symmetric search ("target opponent's library" — Head Games;
+    # "each player searches their library" — Oath of Lieges): searching
+    # SOMEONE ELSE's library, or a symmetric search that reaches everyone,
+    # is a fundamentally different card (opponent-directed disruption, not
+    # a self-tutor) even though the old preset's `search (?:your|target
+    # opponent's|a) library` regex explicitly widened to catch the
+    # opponent-directed phrasing too. 121 preset-only residue (scoping
+    # census) is this veto's territory: every preset-only card the census
+    # sampled is a directed/symmetric search the tutor lane deliberately
+    # excludes by design — an adjudicated exclusion (cite the lane's own
+    # veto comment), not a preset-noise catch the old regex correctly
+    # avoided nor a genuine capability loss for the SELF-tutor concept this
+    # preset is named for.
+    # Ramp — the Command-Zone template's mana-acceleration role (ADR-0051). A
+    # VIEW over the signal path, all in `_ramp_concept` (the role is "NONLAND
+    # and …", an AND the OR-combined arms can't express). `_analysis.roles.
+    # is_ramp` IS this preset for a card the signal path covers, and the tuner's
+    # ramp candidate search reads the same preset — so "counts as ramp" and
+    # "sourced as ramp" cannot drift, and a `card-search --preset ramp` page is
+    # never filled with mana lands.
+    Preset(
+        name="ramp",
+        description=(
+            "Nonland mana acceleration: mana rocks / dorks / rituals, mana "
+            "amplifiers, land-fetch-to-battlefield, extra land drops, and "
+            "Treasure makers you keep."
+        ),
+        concept=_ramp_concept,
+        should_match=(
+            "Sol Ring",
+            "Gilded Lotus",
+            "Cultivate",
+            "Azusa, Lost but Seeking",
+            "Burgeoning",
+            "Dockside Extortionist",
+        ),
+        should_not_match=(
+            "Lightning Bolt",
+            "Demonic Tutor",
+            "Sylvan Scrying",
+            "Command Tower",
+            "An Offer You Can't Refuse",
+        ),
+    ),
+    Preset(
+        name="tutors",
+        description=(
+            "Searches your library for a card (BANNED in shared-library "
+            "format). Land-fetch-to-battlefield (Rampant Growth, Cultivate) "
+            "is ramp, not a tutor (lf_ramp convention)."
+        ),
+        signal_keys=("tutor",),
+        should_match=("Demonic Tutor", "Sylvan Scrying"),
+        should_not_match=(
+            "Lightning Bolt",
+            "Llanowar Elves",
+            "Sakura-Tribe Elder",
+            "Cultivate",
+        ),
+    ),
+    # Creature-token creation. Oracle text uses both singular ("create a
+    # 1/1 ... creature token") and plural ("create two 1/1 ... creature
+    # tokens"), so the count atom here accepts "a"/"an" in addition to
+    # digit/word-form numbers. Includes Embalm and Eternalize — their
+    # reminder text says "Create a token that's a copy of it" (omitting
+    # "creature token" literally), so the regex misses them; the keyword
+    # tuple catches them instead.
+    Preset(
+        name="tokens",
+        description=(
+            "Creates one or more creature tokens, including the keywords that "
+            "make them: Embalm, Eternalize, Populate, Amass, Offspring, Manifest, "
+            "Cloak, Incubate, Fabricate, Afterlife, Mobilize, Encore, Myriad, "
+            "Endure."
+        ),
+        notes=(
+            "task #83 structural-view conversion: the `token_maker` signal key (a "
+            "CreateToken effect) UNION the broad family of keywords that create "
+            "tokens as part of their OWN keyword template rather than a "
+            "separately-tagged effect (`token_maker` doesn't fire on the keyword "
+            "alone): Embalm and Eternalize (Zombie copies from graveyard), "
+            "Populate (copy your own token), Amass (Zombie Army), Offspring (1/1 "
+            "copy), Manifest and Cloak (face-down 2/2), Incubate (Incubator "
+            "transform token), Fabricate (Servos), Afterlife (Spirits on death), "
+            "Mobilize (attacking Warriors), Encore (attacking copies), Myriad "
+            "(combat token copies), Endure (CR 702.62 — counters OR a Spirit "
+            "token, a genuine possible-token maker). Corpus diff vs the old regex "
+            "(commander-legal, by oracle_id): 18 preset-only before the Endure "
+            "keyword closed 10 of them (a modal 'put counters or make a Spirit "
+            "token' cycle); the remaining 8 are a small, named residual, not "
+            "fixed here (a lane change, out of scope for a view conversion) — "
+            "Afterlife Insurance / Infantry Shield TEMPORARILY GRANT the "
+            "Afterlife / Mobilize keyword to a creature ('creatures you control "
+            "gain afterlife 1 until end of turn') rather than printing it, so the "
+            "keyword-array check (which reads the CARD's own printed keywords) "
+            "never fires; the other 6 use the `Gift` keyword's token-flavored "
+            "variant ('Gift a tapped Fish') — `Gift` itself is too coarse to "
+            "union (most Gift cards gift a card, life, or something else, never a "
+            "token), so the token-specific Gift cards stay a narrow, acceptable "
+            "residual."
+        ),
+        keywords=(
+            "Embalm",
+            "Eternalize",
+            "Populate",
+            "Amass",
+            "Offspring",
+            "Manifest",
+            "Cloak",
+            "Incubate",
+            "Fabricate",
+            "Afterlife",
+            "Mobilize",
+            "Encore",
+            "Myriad",
+            "Endure",
+        ),
+        signal_keys=("token_maker",),
+        should_match=(
+            "Omen of the Sun",
+            "Blade Splicer",
+            "Lingering Souls",
+            "Angel of Sanctions",  # Embalm
+        ),
+        should_not_match=("Lightning Bolt", "Anointed Procession", "Intangible Virtue"),
+    ),
+    # Sacrifice outlet / payoff (task #83 structural-view conversion). The
+    # crosswalk `sacrifice_outlets` signal (see
+    # `_analysis.lanes._sacrifice_outlets`) is DELIBERATELY
+    # broader than the old "sacrifice X: <effect>" regex: it is the
+    # concept's own true scope — a repeatable activated-cost outlet
+    # (Viscera Seer, Ashnod's Altar), a ONE-SHOT outlet (an alt-cost pitch
+    # — Salvage Titan, Anchor to Reality; an ETB "sacrifice any number" —
+    # Angelic Aberration; Devour/Exploit/Casualty/Bargain), a GRANTED
+    # outlet (Lunarch Mantle), OR a sacrifice PAYOFF (a `sacrificed`/
+    # `exploited` trigger with no outlet of its own — Cabal Therapist,
+    # Blood Artist-style death-payoff cousins) — CR 701.21. A random
+    # 25-card sample of the ~875 corpus cards this view gains over the old
+    # regex (session adjudication) confirmed every one is genuinely
+    # sacrifice-related (one-shot/alt-cost/granted outlets or payoffs),
+    # not noise the regex correctly excluded — the regex's narrower
+    # "repeatable, colon-suffixed cost" phrasing was UNDER-catching this
+    # whole family, not over-catching a different one.
+    #
+    # DEFERRED single-card gap (not fixed here — a lane change needs the
+    # full corpus-diff + CR-citation bar, out of scope for a view
+    # conversion): Rakdos Riteknife (equipment) grants its wielder
+    # "{T}, Sacrifice a creature: Put a blood counter…" bundled into ONE
+    # static ability alongside a dynamic +1/+0 pump ("Equipped creature
+    # gets +1/+0 for each blood counter … and has '…'"). phase-rs parses
+    # that combined static ability as a bare `AddDynamicPower`
+    # modification with NO `GrantAbility` node for the quoted granted
+    # ability at all (verified via `_ir_lookup.trees_for` — the granted
+    # activated ability's text is dropped from the typed tree entirely),
+    # so `_sac_outlet_granted_cost`'s `GrantAbility` walk has nothing to
+    # find. This is a phase-rs parse gap on the "buff + grant" combined
+    # idiom, not a crosswalk-lane bug; the old regex caught it via the
+    # mid-sentence ", sacrifice a creature:" text this view can't yet
+    # reach structurally. One card of 303 (recall 0.997) — the view is
+    # still correct to ship; this card is the residual tail.
+    Preset(
+        name="sacrifice-outlet",
+        description=(
+            "Has a sacrifice outlet (repeatable activated, one-shot "
+            "alt-cost, granted, or ETB) OR triggers on a sacrifice you "
+            "make (sacrifice PAYOFF) — CR 701.21. Broader than the old "
+            "'repeatable activated cost' regex; see the crosswalk "
+            "conversion note above."
+        ),
+        signal_keys=("sacrifice_outlets",),
+        should_match=("Viscera Seer", "Ashnod's Altar"),
+        should_not_match=(
+            "Lightning Bolt",
+            "Llanowar Elves",
+            "Diabolic Edict",
+            "Fleshbag Marauder",
+        ),
+    ),
+    # Burn: direct damage to creature or player (task #83 structural-view
+    # conversion). Union of `direct_damage` (CR 120.1 — a DealDamage /
+    # DamageEachPlayer / DamageAll effect that reaches a PLAYER — Lightning
+    # Bolt, Fanatic of Mogis) and `removal` (CR 701.8/701.8a — includes its
+    # DealDamage-to-a-permanent arm, so a creature-only bolt like Shock is
+    # covered too). See `_analysis.lanes._direct_damage` /
+    # `._removal`. 6 preset-only residue (scoping census: Arc Spitter,
+    # Lavamancer's Skill, Pathway Arrows, Showstopper, Shuriken, Tyrant's
+    # Familiar) — every one is a "deals N damage to target creature" ability
+    # GRANTED onto another permanent (an Equipment's "equipped creature has
+    # '{cost}: deals N damage...'", an Aura's "enchanted creature has...", a
+    # Lieutenant-conditional granted attack trigger) rather than the card's
+    # OWN direct effect; `_removal`'s per-unit `effect_concepts` walk (unlike
+    # `direct_damage`'s player-reaching arm, which already recovers a
+    # GRANTED damage effect via `has_nested_damage_reaching_player`) does not
+    # descend into a granted ability's body for a permanent-targeted damage
+    # effect. A genuine, narrow gap (6 of 1274, recall 0.995) — deferred, not
+    # fixed here: extending `_removal`'s granted-ability descent is a lane
+    # change with its own corpus-diff + CR-citation bar, out of scope for a
+    # view conversion.
+    Preset(
+        name="burn",
+        description=(
+            "Deals direct damage to a creature, player, planeswalker, or any target."
+        ),
+        signal_keys=("direct_damage", "removal"),
+        should_match=("Lightning Bolt",),
+        should_not_match=(
+            "Counterspell",
+            "Llanowar Elves",
+            "Circle of Protection: Red",
+            "Healing Salve",
+        ),
+    ),
+    # Reanimate-to-battlefield: the classic "put target creature card from a
+    # graveyard onto the battlefield" effect. Structural view (task #83):
+    # union of `creature_recursion` (CR 700.4/401.4/404 — a Graveyard→
+    # Battlefield ChangeZone over a Creature-cored filter, controller-gated
+    # so an opponent's-graveyard-ONLY pull reads as graveyard hate rather
+    # than your loop) and `reanimator` (CR 700.4/603.6e — the creature-
+    # PERMANENT that itself has a GY→battlefield ChangeZone, the archetype
+    # card rather than the spell). See `_analysis.lanes.
+    # _creature_recursion` / `._reanimator`.
+    #
+    # DEFERRED residue (17 preset-only, scoping census; NOT fixed here — a
+    # lane change or substrate fix is out of scope for a view conversion),
+    # two distinct classes, verified against phase's own parse (not just
+    # the crosswalk read):
+    #
+    # 1. ADJUDICATED EXCLUSION (the lane's own Gate #6 — "subject
+    #    controller != Opponent... an opponents'-graveyard-ONLY pull is
+    #    graveyard hate, not your loop"): Agadeem Occultist, Ashen Powder,
+    #    Gruesome Encore, Immortal Obligation, Macabre Mockery, Nurgle's
+    #    Conscription, Puppeteer Clique all target "a creature card from AN
+    #    OPPONENT'S graveyard" — a design choice already made by the lane,
+    #    not a bug this conversion introduces.
+    # 2. GENUINE SUBSTRATE GAP (phase-rs's parse itself, confirmed via the
+    #    raw card-data.json records, not a crosswalk-lane miss): Animate
+    #    Dead / Necromancy structure the return as an Aura's "return
+    #    ENCHANTED creature card to the battlefield" (an enchanted-permanent
+    #    reference, not a typed Creature `SearchLibrary`/`ChangeZone` filter
+    #    the lane's subject test reads) — CR 303.4g aura-attach idiom, no
+    #    existing crosswalk lane helper reads this shape yet. Can't Stay
+    #    Away / Heroic Return are worse: phase's own record has an EMPTY
+    #    `abilities` array for the card — the primary "Return target
+    #    creature card from your graveyard to the battlefield" effect isn't
+    #    parsed into ANY node at all (only the attached "if it enters this
+    #    way" replacement survives), a parser-level swallow on the
+    #    template-plus-replacement-clause idiom. Aerith, Last Ancient /
+    #    Doctor Jane Foster / Karai, Future of the Foot have a genuinely
+    #    conditional destination (return to hand, UNLESS a condition —
+    #    lifegain, sneak cost — then to the battlefield instead); Liliana,
+    #    Waker of the Dead's is emblem-granted. None of these have a
+    #    reachable typed node a bounded concept predicate could reuse
+    #    without hand-rolling new text detection, which the standing rule
+    #    forbids — genuinely deferred to a future substrate/lane task, not
+    #    silently dropped.
+    Preset(
+        name="reanimate",
+        description=(
+            "Returns a creature card from a graveyard — to the battlefield "
+            "(Reanimate, Animate Dead) or to your hand (Gravedigger): creature "
+            "recursion. Any-card graveyard-to-hand (Regrowth) is the "
+            "graveyard-return preset."
+        ),
+        signal_keys=("creature_recursion", "reanimator"),
+        should_match=("Reanimate", "Gravedigger"),
+        should_not_match=(
+            "Lightning Bolt",
+            "Counterspell",
+            "Regrowth",
+            "Eternal Witness",
+        ),
+    ),
+    # Graveyard-to-hand recursion (Eternal Witness-style). task #83
+    # structural-view conversion: NOT ``signal_keys=("graveyard_makers",)``
+    # — that key bundles THREE GY-interaction directions under one Signal
+    # with no ``subject`` to discriminate them (reanimate GY->Battlefield,
+    # this preset's GY->Hand, and self-mill's Mill->Graveyard — see
+    # ``graveyard_return_direction``'s own docstring). The concept
+    # predicate re-runs the SAME ``change_zone_dirs`` read
+    # ``_graveyard_makers`` performs, keeping the destination that lane's
+    # ``fire()`` helper collapses away.
+    #
+    # ``keywords=("Soulshift", "Recover")`` (task #87): the sanctioned
+    # keyword-array union (mill/goad/magecraft/proliferate precedent) —
+    # BOTH keywords are CR 702.46a/702.59a graveyard-to-hand recursion by
+    # definition, and this arm is the ONLY thing that catches Garza's
+    # Assassin: its whole "Recover—Pay half your life..." clause is a
+    # ``SwallowedClause`` parse_warning upstream, with ZERO surviving
+    # phase-level residue — not even a keyword tag (unlike Kodama of the
+    # Center Tree's dynamic-X Soulshift, which DOES carry a phase-native
+    # ``AddKeyword`` marker read structurally by
+    # ``graveyard_return_direction`` itself). Harmless-redundant for every
+    # properly-parsed Soulshift/Recover carrier (a FIXED-N Soulshift or a
+    # Coldsnap Recover cycle card already carries a full ``ChangeZone``
+    # trigger the concept arm catches on its own — corpus-swept 2026-07,
+    # 32/34 total carriers).
+    Preset(
+        name="graveyard-return",
+        description=(
+            "Returns a card from a graveyard to a player's hand "
+            "(Eternal Witness, Regrowth, Raise Dead)."
+        ),
+        keywords=("Soulshift", "Recover"),
+        concept=_graveyard_return_concept,
+        should_match=(
+            "Regrowth",
+            "Eternal Witness",
+            "Garza's Assassin",
+            # task #87 census residue — one representative per shape
+            # class the ``graveyard_return_direction`` predicate's own
+            # docstring names: a modal ``ChooseMode`` branch, the
+            # opponent-chooses idiom, a cost-shaped ``ReturnToHand``
+            # rider, and a dynamic-X Soulshift keyword grant.
+            "Ghostly Dancers",
+            "Tasigur, the Golden Fang",
+            "Harvest Wurm",
+            "Kodama of the Center Tree",
+            # task #np_gyfam — two more residue shapes: a for-each-loop
+            # recursion phase drops entirely to an Unimplemented node (the
+            # clause-grammar's ``graveyard_return`` token recovers it —
+            # All Suns' Dawn), and a "mill, then return unless pay" unit
+            # whose consequence carries NO effect node at all (Sivriss,
+            # Nightmare Speaker — the unit's own ``unless_pay`` field is
+            # the only surviving trace).
+            "All Suns' Dawn",
+            "Sivriss, Nightmare Speaker",
+        ),
+        # task #87 census non-members (verified structurally False):
+        # each of these carries a graveyard-TO-BATTLEFIELD reanimation
+        # ability (Dread Wanderer / Cauldron Dance / Evershrike /
+        # Defossilize / Greasefang, Okiba Boss) or a dredge alternative-
+        # draw (The Necrobloom) — none is a graveyard-TO-HAND recursion.
+        should_not_match=(
+            "Lightning Bolt",
+            "Dread Wanderer",
+            "Cauldron Dance",
+            "Evershrike",
+            "Defossilize",
+            "Greasefang, Okiba Boss",
+            "The Necrobloom",
+        ),
+    ),
+    # Cantrip (task #83 structural-view conversion): a low-opportunity-cost
+    # spell that draws exactly ONE card as a RIDER on another primary
+    # effect (Preordain, Opt, Ponder, Remand — CR 121.1). The crosswalk
+    # ``cantrip`` lane (lanes._cantrip) is a BOUNDED read (a
+    # fixed-1, non-scaling Draw sharing its unit with a sibling non-draw
+    # effect, gated to Instant/Sorcery, recipient never Opponent) —
+    # corpus-scanned to 433 commander-legal hits vs the deleted regex's
+    # unbounded ~3174-card "draws a card" substring match. Rhystic Study
+    # correctly falls OUT (an enchantment, not Instant/Sorcery — a
+    # repeatable payoff engine, not a one-shot rider; routes to
+    # enchantments_matter/opponent_cast_matters instead) and Divination
+    # correctly falls out (a bare 2-for-1 draw spell with no sibling
+    # effect — the WHOLE point of the card, not a rider).
+    Preset(
+        name="self-recurring",
+        description=(
+            "Brings itself back for another use: returns from the graveyard "
+            "(Bloodghast, Gravecrawler), re-suspends (Arc Blade), returns itself "
+            "to hand (Arcanis the Omnipotent), or recurs by keyword (flashback, "
+            "escape, buyback, embalm)."
+        ),
+        notes=(
+            "Structural view: signal key `self_recurring` "
+            "(`lanes.card_advantage.recurs_itself`); cut-check's self-recurring "
+            "flag reads this preset. The `keywords` arm covers the cards whose "
+            "recursion phase v0.94.0 drops: aftermath's graveyard half, Garza's "
+            "Assassin's recover, Salvation Colossus's unearth, a land's mayhem "
+            "(Oscorp Industries) (`test_self_recurring_keyword_gap_canary`)."
+        ),
+        keywords=SELF_RECURRING_KEYWORD_GAPS,
+        signal_keys=("self_recurring",),
+        should_match=(
+            "Bloodghast",
+            "Gravecrawler",
+            "Arc Blade",
+            "Arcanis the Omnipotent",
+            "Faithless Looting",
+            "Dusk // Dawn",
+        ),
+        should_not_match=(
+            "Eternal Witness",
+            "Man-o'-War",
+            "Aetherling",
+            "Ancestral Vision",
+        ),
+    ),
+    Preset(
+        name="self-recurring-fodder",
+        description=(
+            "A creature that brings itself back out of the graveyard — onto the "
+            "battlefield, to hand, cast, or as a token copy (Bloodghast, Kitchen "
+            "Finks, Pyre Zombie, Gravecrawler, Sacred Cat): sacrifice fodder that "
+            "comes back."
+        ),
+        notes=(
+            'The "Self-recurring fodder" sub-avenue\'s search; its serve reads the '
+            "same predicate (`lanes.card_advantage.comes_back_from_graveyard` over "
+            "`FODDER_SELF_RETURNS`). A card that comes back as a non-creature — an "
+            "Ojer god's land, Accursed Witch's Curse, Harold and Bob's Aura, a "
+            "disturb Aura — or only from the battlefield (Arcanis) is out."
+        ),
+        concept=_fodder_concept,
+        should_match=(
+            "Bloodghast",
+            "Kitchen Finks",
+            "Pyre Zombie",
+            "Anointer Priest",
+            "Loyal Cathar // Unhallowed Cathar",
+        ),
+        should_not_match=(
+            "Arcanis the Omnipotent",
+            "Ojer Axonil, Deepest Might // Temple of Power",
+            "Accursed Witch // Infectious Curse",
+            "Harold and Bob, First Numens",
+            "Brine Comber // Brinebound Gift",
+            "Sun Titan",
+        ),
+    ),
+    Preset(
+        name="cantrip",
+        description=(
+            "Draws exactly ONE card as a rider or primary effect. For "
+            "multi-card draw effects use 'card-draw'."
+        ),
+        signal_keys=("cantrip",),
+        should_match=("Preordain", "Opt", "Ponder", "Remand"),
+        should_not_match=(
+            "Lightning Bolt",
+            "Llanowar Elves",
+            "Rhystic Study",
+            "Divination",
+        ),
+    ),
+    # Card draw (multi-card effects): draws 2+ cards in a single effect.
+    # Does not overlap with cantrip. task #83 structural-view conversion:
+    # ``card_draw_engine`` alone is the recurring/bulk-draw lane and
+    # deliberately EXCLUDES a one-shot ETB bulk draw (Mulldrifter's "when
+    # ~ enters, draw two cards" — see that lane's own docstring), so it
+    # ORs with ``etb_bulk_draw`` (the lanes package, next to
+    # ``_card_draw_engine``) to reach it. The two arms are structurally
+    # disjoint (one requires an ``enters`` trigger, the other excludes
+    # one), so the OR never double-fires a card under both.
+    #
+    # ``draw_for_each`` UNIONED IN (task #86 / #85's census): a "draw a
+    # card for each X" board-scaling draw (Shamanic Revelation, Truth or
+    # Consequences) is functionally a multi-card-draw engine the same as
+    # ``card_draw_engine``, but is its own crosswalk lane (a for-each COUNT
+    # read, CR 120/107.3 — see ``_draw_for_each``'s own docstring) that
+    # never independently sets ``card_draw_engine``. Probed against 14
+    # scaling-draw residue cards (#85's census) — Messenger Jays, Observed
+    # Stasis, Cirdan the Shipwright, Truth or Consequences, Spell
+    # Contortion among them — all carry ONLY ``draw_for_each`` (not
+    # ``card_draw_engine``/``etb_bulk_draw``), confirming the view was
+    # silently dropping them. Narrow lane: 234 of 32,521 commander/brawl-
+    # legal cards (0.7%) carry ``draw_for_each`` corpus-wide — a for-each
+    # scaling read, not a broad "mentions draw" catch-all, so folding it in
+    # doesn't widen the preset the way a raw-text union would.
+    Preset(
+        name="card-draw",
+        description="Draws two or more cards in a single effect.",
+        signal_keys=("card_draw_engine", "draw_for_each"),
+        concept=_etb_bulk_draw_concept,
+        should_match=(
+            "Mulldrifter",
+            "Deep Analysis",
+            "Brainstorm",
+            "Rielle, the Everwise",
+            "Truth or Consequences",  # draw_for_each-only residue
+        ),
+        should_not_match=("Lightning Bolt", "Llanowar Elves", "Opt", "Preordain"),
+    ),
+    # Lifegain — gains life AS an effect, OR cares about gaining life as a
+    # payoff (whenever-trigger). Typed broadly because lifegain as an
+    # archetype includes both the "taps" and the "matters" sides.
+    Preset(
+        name="lifegain",
+        description=(
+            "Gains life OR triggers when you gain life (lifegain-matters), "
+            "including lifelink and the Secrets of Strixhaven Infusion idiom. "
+            "Giving an opponent life (group hug) is not this theme."
+        ),
+        notes=(
+            "task #83 structural-view conversion: signal keys `lifegain_makers` "
+            "(a gain-life EFFECT) + `lifegain_matters` (a your-lifegain PAYOFF, "
+            "including the Secrets of Strixhaven `Infusion` 'if you gained life "
+            "this turn' idiom and a recurring self-life-loss engine read as the "
+            "same 'life as a resource' archetype — Ad Nauseam, Phyrexian Arena "
+            "cousins) UNION the printed `Lifelink` keyword (a keyword-only "
+            "lifelink grant the effect lane doesn't independently derive). Corpus "
+            "diff vs the old regex (commander-legal, by oracle_id): 183 "
+            "preset-only, ALL correctly shed — 173 are old-regex reminder-text "
+            "false positives (a Food/Clue/Ninjutsu token's OWN 'You gain 3 life' "
+            "explainer text, or a granted/modal 'lifelink' mention unrelated to "
+            "the card's own effect) or self-only 'this Aura has lifelink' static "
+            "grants; the remaining 10 (Armistice, Fiery Justice, Phelddagrif, "
+            "...) are OPPONENT-directed lifegain (group-hug 'target opponent "
+            "gains N life') — a different scope than lifegain_makers' `you` read, "
+            "correctly excluded (the same kind of scope-shed the removal preset "
+            "applies elsewhere)."
+        ),
+        keywords=("Lifelink",),
+        signal_keys=("lifegain_makers", "lifegain_matters"),
+        should_match=("Thragtusk", "Lightning Helix", "Efflorescence"),
+        should_not_match=(
+            "Lightning Bolt",
+            "Counterspell",
+            "Sign in Blood",
+            "Bitterblossom",
+        ),
+    ),
+    # +1/+1 counters — puts +1/+1 counters on a creature, OR cares about
+    # creatures with +1/+1 counters. Covers the classic counters-matter
+    # archetype (Simic, Abzan, Hardened Scales, etc.). Excludes other
+    # counter types (loyalty, charge, time, etc.) by anchoring on the
+    # literal "+1/+1" token.
+    #
+    # task #83 named FOUR lane-gap families as the reason this preset
+    # stayed regex/keyword-only (585 -> 379 preset-only residue after
+    # adding self_counter_grow/counter_distribute/Mentor/Explore, ~75% of
+    # a 110-card genuine-miss sample). task #85 re-measured at v0.23 (the
+    # residue had grown to 415, not shrunk — new-set churn outpaces the
+    # bump's own counter-parse additions) and closed all four:
+    #
+    # (1) ETB "enters with N +1/+1 counters" template (Cogwork Grinder,
+    #     Naya Soulbeast, Lupine Harbingers, Worldheart Phoenix, Undead
+    #     Sprinter): phase's static-replacement parser fails outright on
+    #     the computed-X form (decorates ``Unimplemented`` with a
+    #     "Replacement pattern matched but line failed replacement
+    #     parser" raw prefix) and drops the fixed-N form with no node at
+    #     all.
+    # (2) the Kamigawa "Fractal" token+counter cycle (Body of Research,
+    #     Sequence Engine, ...) and its general form (Alien Invasion,
+    #     Amzu, Emissary Green, Furgul, ...): a COMPUTED-amount
+    #     ``PutCounter`` clause following a ``make_token``/other effect in
+    #     the same unit is dropped entirely (mirrors the ``direct_damage``
+    #     computed-amount-clause-drop precedent).
+    # (3) planeswalker LOYALTY abilities placing counters (Jared
+    #     Carthalion's -3, Elspeth Resplendent's +1): the clause survives
+    #     as an ``Unimplemented`` EFFECT-role node with the placement text
+    #     verbatim as its raw.
+    # (4) the "creature(s) [you control] with a +1/+1 counter on it/them"
+    #     PAYOFF condition (Bred for the Hunt, Foundry Hornet, Chronicler
+    #     of Heroes): FOUR distinct typed sites the prior
+    #     ``plus_one_matters`` structural read didn't check — a
+    #     ``deals_damage``/``attacks``-mode trigger's ``valid_source``
+    #     (only ``valid_card`` was read), a static/trigger ``ControlsType``
+    #     condition (only ``IsPresent`` was read), a ``QuantityCheck``
+    #     whose ``Ref`` wraps an ``ObjectCount`` filter (only the direct
+    #     ``CountersOn`` shape was read), and the v0.23-bump-added
+    #     ``HadCounters`` past-tense condition on a leaves-the-battlefield
+    #     trigger (Promising Duskmage's dies-with-a-counter check — only
+    #     the live-object ``HasCounters`` tag was read).
+    #
+    # (1)+(2)+(3) close via one bucket-B ``tree_synthesis`` bridge feeding
+    # ``plus_one_makers`` (:func:`mtg_utils._analysis.tree_synthesis.
+    # _arm_plus_one_makers` — see its own docstring for the unified idiom
+    # read and why reminder-stripping keeps it from re-opening the
+    # Connive/Amass/Explore/Incubate/Megamorph/Awaken keyword-mechanic
+    # shed). (4) closes as four genuine structural-read widenings in
+    # ``lanes._plus_one_matters`` (no bridge — real typed
+    # fields/tags the prior code just didn't check yet).
+    #
+    # Re-measuring the post-fix residual (a 194-card manual census: the
+    # task #83 four-family examples plus every remaining preset-only
+    # card) found no OTHER fixable structural gap — it splits cleanly
+    # into six documented, CR-grounded exclusion classes (every card
+    # individually checked, none silently dropped):
+    #
+    # * reanimation/zone-change-with-a-bonus-counter (CR 614.12 — a
+    #   replacement rider on a graveyard/exile/dies recursion effect, the
+    #   counter is incidental to the RECURSION, not this preset's DOER;
+    #   ~29 cards — A-Graveyard Shift, Drana, Undying Malice, Valkyrie's
+    #   Call, ...).
+    # * cost-reduction-by-counter-count (CR 118.7 — Hamza, Starport
+    #   Security: the counter is a THRESHOLD reference for an unrelated
+    #   cost reducer).
+    # * a kind-AGNOSTIC "with/has A counter on it" reference (Michelangelo,
+    #   Mutant BFF — CR 122.1 requires a KIND; belongs to
+    #   any_counter_matters, the SAME split ``_plus_one_matters``'s own
+    #   docstring already documents for The Swarmlord/Cleopatra).
+    # * an EQ-0/negation "no +1/+1 counter"/"without a +1/+1 counter"
+    #   predicate (Hindervines, Wave Goodbye — the inverse of a
+    #   counter-caring payoff; already deliberately excluded corpus-wide
+    #   per ``_plus_one_matters``'s own documented Hindervines exception).
+    # * a GRANTED keyword/ability, or a SEPARATELY CREATED permanent's own
+    #   ability, placing the counter — never this card's own effect. task
+    #   #87 re-adjudicated this whole class (~36 cards, per-card raw-phase-
+    #   shape inspection) and closed the GRANTED-KEYWORD half via
+    #   ``crosswalk.nested_plus_one_keyword_grant`` (see its own docstring
+    #   for the three structural shapes read):
+    #     - CLOSED: a top-level static's ``AddKeyword`` grant of
+    #       Bloodthirst/Devour/Scavenge/Dethrone/Evolve/Training/Mentor to
+    #       something OTHER than the card itself (Twins of Discord's
+    #       granted Bloodthirst, Varolz / Young Deathclaws's granted
+    #       Scavenge, Propagator Drone's granted Evolve, Elder Arthur
+    #       Maxson's / Warrior's Resolve's granted Training, Aegis of the
+    #       Legion's Equip-granted Mentor); a ``BecomeCopy`` copy-exception
+    #       grant (Dack's Duplicate's granted Dethrone); a CREATED TOKEN's
+    #       OWN keyword profile (Dragon Broodmother's Devour token).
+    #     - STILL OUT, different shape, genuinely out of THIS mechanism's
+    #       reach: Sunburst (Lux Artillery, Solar Array — CR 702.44
+    #       branches +1/+1 vs charge counters by the affected permanent's
+    #       type, a fork the granting site can't resolve) and Riot (Domri,
+    #       Chaos Bringer — CR 702.136 haste-OR-counter CHOICE, never a
+    #       guaranteed placement) are deliberately excluded from the
+    #       keyword set itself, not a recall gap — see
+    #       ``nested_plus_one_keyword_grant``'s own docstring.
+    #     - STILL OUT, genuine phase-parse SUBSTRATE gap (no ability body
+    #       at all in card-data.json, verified against the raw record):
+    #       the "Mutagen token" cycle (April O'Neil, Crustacean Commando,
+    #       Genghis Frog, Mona Lisa, Mutagen Man, Mutant Chain Reaction,
+    #       Ooze Spill, Return to the Sewers, Shellshock, Slithering
+    #       Cryptid, Zoo Escapees) and the "Young Hero Role" token cycle
+    #       (Cut In, Embereth Veteran, Merry Bards, Protective Parents,
+    #       Return Triumphant) create PREDEFINED tokens whose own
+    #       activated/triggered ability phase never parses (the ``Token``
+    #       effect node's ``keywords``/``static_abilities`` fields are
+    #       both empty — the reminder text lives only in phase's engine-
+    #       side ``known-tokens.toml``, a different data source this
+    #       crosswalk never reads); Ral and the Implicit Maze's created
+    #       Spellgorger Weird token has the SAME gap for its own CUSTOM
+    #       (non-keyword) triggered ability.
+    #     - STILL OUT, a delayed "one-time boon" granted to a FUTURE spell
+    #       (Arcane Archery, Champions of Tyr, March Toward Perfection,
+    #       Tenacious Pup) or a bare Amass/Incubate ACTION reference from a
+    #       loyalty ability or spell effect (Angrath, Commence the
+    #       Endgame, Assimilate Essence, Excise the Imperfect, Tangled
+    #       Skyline) — BOTH verified this session to be WHOLLY DROPPED by
+    #       phase's own parse (no node at all, not even an ``Unimplemented``
+    #       stub — Arcane Archery's boon-grant text and Commence the
+    #       Endgame's "amass Zombies X" clause are simply absent from the
+    #       card's typed ``abilities`` list), so no structural read of any
+    #       shape can reach them — a genuine phase substrate gap, not a
+    #       lane-mechanism gap.
+    #   Ledgered here, not silently dropped.
+    # * niche singleton residue, individually inspected and genuinely
+    #   ambiguous/complex enough to defer rather than force a fix:
+    #   Biomancer's Familiar (a counter-COUNT reference for an unrelated
+    #   Adapt-nerf, not a cares-about), Blightbeetle (a counter-PLACEMENT
+    #   DENIAL static on opponents' creatures — the inverse of a doer),
+    #   Bewitching Leechcraft (the counter is a RESOURCE for an unrelated
+    #   untap-lock Aura, opponent-directed), Ion Storm (a P1P1-OR-charge
+    #   alternative counter-sink cost), Rite of the Serpent (a
+    #   target-had-a-counter removal rider), Tizerus Charger (an
+    #   Escape-cost modal counter CHOICE), Cosima // The Omenkeel (a
+    #   self-granted delayed replacement ability, one card).
+    #
+    # Legitimate different-archetype exclusions carried over unchanged
+    # from task #83's own finding: counter_doubling (its own lane) and
+    # opponent-directed placement (a different scope than this preset's
+    # ``you`` read). Keyword mechanics whose OWN +1/+1-counter rider is
+    # reminder text on a DIFFERENT primary mechanic stay shed to their
+    # existing preset/lane: Connive (CR 702.153, cantrip), Amass/Incubate
+    # (CR 701.47/701.53, token-preset), Megamorph (CR 702.75,
+    # facedown_makers), Undying/Persist (CR 702.92/702.79, their own
+    # death-replacement lane). Mentor (CR 702.134) and Explore (CR
+    # 701.44) join the keywords list per task #83's own scoping-pass
+    # recommendation — both mechanics' placement is unconditional-or-
+    # primary, the same class as Bolster; Awaken (CR 702.113), Ravenous
+    # (CR 702.156), and Scavenge (CR 702.97) join for the identical
+    # reason (task #85 finding — Boiling Earth's land-animation counters,
+    # Tervigon's ETB counters, the Golgari scavenge cycle's recursion-
+    # into-counters).
+    Preset(
+        name="plus-one-counters",
+        description=(
+            "Puts +1/+1 counters on creatures OR cares about creatures with "
+            "+1/+1 counters (counters-matter archetype). Includes every "
+            "keyword whose primary mechanic is adding +1/+1 counters: "
+            "Bolster, Increment (SOS), Reinforce, Monstrosity, Graft, "
+            "Outlast, Renown, Evolve, Adapt, Modular, Fabricate (modal), "
+            "Training, Support, Tribute, Endure (modal), Devour, Dethrone, "
+            "Mentor, Explore, Awaken, Ravenous, Scavenge."
+        ),
+        keywords=(
+            "Bolster",
+            "Increment",
+            "Reinforce",
+            "Monstrosity",
+            "Graft",
+            "Outlast",
+            "Renown",
+            "Evolve",
+            "Adapt",
+            "Modular",
+            "Fabricate",
+            "Training",
+            "Support",
+            "Tribute",
+            "Endure",
+            "Devour",
+            "Dethrone",
+            "Mentor",
+            "Explore",
+            "Awaken",
+            "Ravenous",
+            "Scavenge",
+        ),
+        signal_keys=("plus_one_makers", "plus_one_matters", "counter_distribute"),
+        concept=_plus_one_counters_self_grow_concept,
+        should_match=(
+            "Scavenging Ooze",
+            "Goldvein Hydra",
+            "Berta, Wise Extrapolator",
+            "Cogwork Grinder",
+            "Body of Research",
+            "Jared Carthalion",
+            "Bred for the Hunt",
+        ),
+        should_not_match=("Lightning Bolt", "Counterspell", "Esper Sentinel"),
+    ),
+    # Cantrip gets Connive added via keywords tuple — Connive's core effect
+    # is "draw a card, then discard a card" (with a +1/+1 rider on nonland
+    # discards), so it's card-filtering; matches cantrip's single-card-draw
+    # semantics.
+    Preset(
+        name="connive",
+        description=(
+            "Keyword action from Streets of New Capenna: draw a card, "
+            "then discard a card. If a nonland card was discarded, put "
+            "a +1/+1 counter on the conniving creature."
+        ),
+        keywords=("Connive",),
+        should_match=("Change of Plans",),
+        should_not_match=("Lightning Bolt", "Agna Qel'a", "Desolate Lighthouse"),
+    ),
+    # ── Cost-reduction via tapping (Convoke / Improvise / Waterbend) ──
+    #
+    # All three let you tap untapped permanents rather than pay mana to
+    # cast a spell. Convoke (702.51) taps creatures; Improvise (702.126)
+    # taps artifacts; Waterbend (701.67) taps both — it's the Avatar
+    # crossover's generalized "each tap pays for {1}" cost mechanic.
+    Preset(
+        name="convoke",
+        description=(
+            "Tap untapped creatures you control rather than pay mana to "
+            "cast a spell (CR 702.51)."
+        ),
+        keywords=("Convoke",),
+        should_match=("Crowd's Favor",),
+        should_not_match=("Lightning Bolt", "Chief Engineer", "Party Thrasher"),
+    ),
+    Preset(
+        name="improvise",
+        description=(
+            "Tap untapped artifacts you control rather than pay mana to "
+            "cast a spell (CR 702.126). Artifact-cost-reduction sibling "
+            "of Convoke."
+        ),
+        keywords=("Improvise",),
+        should_match=("Battle at the Bridge",),
+        should_not_match=(
+            "Lightning Bolt",
+            "The Fifteenth Doctor",
+            "Archway of Innovation",
+        ),
+    ),
+    Preset(
+        name="waterbend",
+        description=(
+            "Alt-cost mechanic from the Avatar crossover (CR 701.67). "
+            "While paying a waterbend cost, tap untapped artifacts or "
+            "creatures to help — each tap pays for {1}. Generalizes "
+            "Convoke + Improvise into a single keyword action."
+        ),
+        keywords=("Waterbend",),
+        should_match=("Aang's Iceberg",),
+        should_not_match=("Lightning Bolt", "Crowd's Favor", "Gather Courage"),
+    ),
+    # ── Airbend (Avatar crossover) ──
+    #
+    # Per CR 701.65 (glossary says "Airbend", not "Airbending" — the
+    # Scryfall keywords array uses "Airbend"): exiles one or more
+    # permanents/spells; the owner of each exiled card may cast it
+    # from exile for {2}. Mechanically closer to Warp/Suspend than
+    # to bounce; NOT in the `bounce` preset because airbend never
+    # returns cards to hand.
+    #
+    # Does NOT include Warp (CR 702.185) — Warp is a cast-from-hand-
+    # for-alternative-cost-then-exile-at-EOT keyword (a suspend-like
+    # cast-later mechanic), distinct enough from airbend's "exile
+    # someone else's thing, they may recast for {2}" mechanic that
+    # bundling them would conflate politically very different cards.
+    Preset(
+        name="airbend",
+        description=(
+            "Exile a permanent or spell and let its owner cast it from "
+            "exile for {2} (Airbend, Avatar crossover, CR 701.65)."
+        ),
+        keywords=("Airbend",),
+        should_match=("Aang, the Last Airbender",),
+        should_not_match=("Lightning Bolt", "Unsummon", "Boomerang"),
+    ),
+    # ── Proliferate ──
+    Preset(
+        name="proliferate",
+        description=(
+            "Choose any number of permanents and/or players with counters "
+            "and add another counter of each kind. Scales with +1/+1, "
+            "poison, -1/-1, charge, loyalty counters — so proliferate "
+            "decks usually pair with counter-producing archetypes."
+        ),
+        keywords=("Proliferate",),
+        should_match=("Contagion Clasp", "Atraxa, Praetors' Voice"),
+        should_not_match=(
+            "Lightning Bolt",
+            "Abzan Advantage",
+            "Anafenza, Kin-Tree Spirit",
+        ),
+    ),
+    # ── Goad (political / multiplayer) ──
+    Preset(
+        name="goad",
+        description=(
+            "Forces a creature to attack each combat if able, and to attack a "
+            "player OTHER THAN the one who goaded it (the goader) — not merely "
+            "other than its own controller. So goading an opponent's creature "
+            "steers it at your other opponents, not you. Multiplayer politics "
+            "mechanic (CR 701.15)."
+        ),
+        keywords=("Goad",),
+        should_match=("Disrupt Decorum",),
+        should_not_match=("Lightning Bolt", "Bloodshed Fever", "Crazed Goblin"),
+    ),
+    # ── Magecraft (Strixhaven spellslinger) ──
+    Preset(
+        name="magecraft",
+        description=(
+            "Triggers 'whenever you cast or copy an instant or sorcery "
+            "spell' — the Strixhaven spellslinger payoff. Mechanically "
+            "overlaps with Prowess (combat buff on spell cast) but "
+            "Magecraft can trigger any effect, so it gets its own preset."
+        ),
+        keywords=("Magecraft",),
+        should_match=("Storm-Kiln Artist", "Archmage Emeritus"),
+        should_not_match=("Lightning Bolt", "Monastery Swiftspear", "Soul-Scar Mage"),
+    ),
+    # ── Opus (Secrets of Strixhaven big-spells trigger) ──
+    Preset(
+        name="opus",
+        description=(
+            "Triggers on instant/sorcery casts with a 5+-mana threshold. "
+            "The effect can be anything — not just combat buffs — and "
+            "Opus cards typically have a lesser mode that triggers for "
+            "cheaper instants/sorceries as well. Big-spells-matter "
+            "spellslinger archetype."
+        ),
+        keywords=("Opus",),
+        should_match=("Colorstorm Stallion",),
+        should_not_match=("Lightning Bolt", "Monastery Swiftspear"),
+    ),
+    # ── Graveyard-cast umbrella (cast-from-graveyard mechanics) ──
+    #
+    # Strict: only keywords that actually CAST the card from the
+    # graveyard. Notably excludes:
+    #   * Embalm/Eternalize — create a TOKEN COPY, not cast the card.
+    #     These live in the `tokens` preset.
+    #   * Unearth — RETURNS the card to the battlefield, not cast.
+    #     Lives in the `reanimate` preset.
+    Preset(
+        name="graveyard-cast",
+        description=(
+            "Umbrella for 'cast this card from the graveyard' keyword mechanics: "
+            "Flashback, Jump-start, Aftermath, Retrace, Escape, Disturb, Mayhem. "
+            "Graveyard-value payoff. The narrower per-keyword presets still "
+            "exist; use this one for the full cast-from-graveyard archetype."
+        ),
+        keywords=(
+            "Flashback",
+            "Jump-start",
+            "Aftermath",
+            "Retrace",
+            "Escape",
+            "Disturb",
+            "Mayhem",
+            "Harmonize",
+        ),
+        should_match=(
+            "Lingering Souls",  # Flashback
+            "Chemister's Insight",  # Jump-start
+            "Kroxa, Titan of Death's Hunger",  # Escape
+        ),
+        should_not_match=(
+            "Lightning Bolt",
+            "Counterspell",
+            "Angel of Sanctions",  # Embalm creates a token, not cast
+        ),
+    ),
+    # ── Cast-later family (exile-then-cast-later mechanics) ──
+    Preset(
+        name="cast-later",
+        description=(
+            "Cards that are cast at a time other than normal spell timing — "
+            "exiled or held to be cast on a future turn, often for an "
+            "alternative cost. Covers Suspend, Foretell, Plot, Warp, "
+            "Rebound, Impending, and Adventure (matched via the 'adventure' "
+            "layout since Scryfall doesn't tag it as a keyword)."
+        ),
+        keywords=(
+            "Suspend",
+            "Foretell",
+            "Plot",
+            "Warp",
+            "Rebound",
+            "Impending",
+        ),
+        layouts=("adventure",),
+        should_match=(
+            "Ancestral Vision",  # Suspend
+            "Scorn Effigy",  # Foretell
+            "Djinn of Fool's Fall",  # Plot
+            "Voidcalled Devotee",  # Warp
+        ),
+        should_not_match=(
+            "Lightning Bolt",
+            "Counterspell",
+            "Dream Devourer",
+            "Epochrasite",
+        ),
+    ),
+    # Free casting: a spell cast without paying its mana cost — the oracle
+    # phrase (the ``free_cast`` structural view; phase carries no 'free'
+    # discriminator, so the phrase is the tell) UNION the keywords that cast
+    # for free by definition, Cascade (CR 702.85a) and Discover (CR 701.57) —
+    # the sanctioned keyword-array union (reanimate's Soulshift/Recover
+    # precedent). Cascade/Discover carriers never fire ``free_cast``
+    # (Bloodbraid Elf, Maelstrom Wanderer: their keyword reminder text is not
+    # the card's own effect), so the union is what makes them members.
+    Preset(
+        name="free-cast",
+        description=(
+            "Casts a spell without paying its mana cost (Omniscience, Fist of "
+            "Suns, Jodah, Archmage Eternal, Kari Zev's Expertise), plus the "
+            "keywords that cast for free: Cascade (CR 702.85a) and Discover "
+            "(CR 701.57)."
+        ),
+        keywords=("Cascade", "Discover"),
+        signal_keys=("free_cast",),
+        should_match=(
+            "Omniscience",
+            "Fist of Suns",
+            "Kari Zev's Expertise",
+            "Bloodbraid Elf",
+        ),
+        should_not_match=("Lightning Bolt", "Rampant Growth", "Sneak Attack"),
+    ),
+    # Cheating into play: a card put onto the battlefield from hand or library
+    # WITHOUT being cast — the ``cheat_into_play`` structural view, whose own
+    # carve-outs are the preset's edges: a land put is ramp (never a cheat),
+    # and the graveyard route is ``reanimate``'s (``creature_recursion``).
+    Preset(
+        name="cheat-into-play",
+        description=(
+            "Puts a card from your hand or library onto the battlefield "
+            "without casting it (Sneak Attack, Show and Tell, Elvish Piper, "
+            "Aether Vial, Kaalia of the Vast, Bribery). Ramp that puts a land "
+            "onto the battlefield is not this theme; the graveyard route is "
+            "the reanimate preset."
+        ),
+        signal_keys=("cheat_into_play",),
+        should_match=(
+            "Sneak Attack",
+            "Show and Tell",
+            "Elvish Piper",
+            "Aether Vial",
+            "Kaalia of the Vast",
+            "Bribery",
+        ),
+        should_not_match=("Rampant Growth", "Cultivate", "Lightning Bolt", "Reanimate"),
+    ),
+    # ── Spell-copy family ──
+    Preset(
+        name="spell-copy",
+        description=(
+            "Copies a spell (self or another spell). Covers Storm, "
+            "Casualty, Replicate, Cipher, Conspire, Demonstrate, and the "
+            "Secrets of Strixhaven 'Paradigm' recurring free-cast-from-"
+            "exile mechanic. Does NOT include Splice (which adds text "
+            "onto an Arcane spell rather than copying) or Prepared "
+            "(which casts a paired spell, not a copy of the current one)."
+        ),
+        keywords=(
+            "Storm",
+            "Casualty",
+            "Replicate",
+            "Cipher",
+            "Conspire",
+            "Demonstrate",
+            "Paradigm",
+        ),
+        should_match=(
+            "Weather the Storm",
+            "Cut of the Profits",  # Casualty
+            "Train of Thought",  # Replicate
+            "Last Thoughts",  # Cipher
+            "Improvisation Capstone",  # Paradigm
+        ),
+        should_not_match=(
+            "Lightning Bolt",
+            "Counterspell",
+            "Anhelo, the Painter",
+            "Ian Chesterton",
+        ),
+    ),
+    # ── Edict family (forced-sacrifice) ──
+    Preset(
+        name="edict",
+        description=(
+            "Forced-sacrifice effects: the defender chooses which permanent to "
+            "sacrifice, a kind of removal that bypasses hexproof and "
+            "indestructible. Includes Annihilator."
+        ),
+        notes=(
+            "task #83 structural-view conversion: the `edict_makers` signal key "
+            "(a forced player-sacrifice of ANY type, CR 701.21a) UNION the "
+            "printed `Annihilator` keyword (a forced-sacrifice-on-attack that the "
+            "effect lane doesn't independently derive). Recall 0.945 vs the old "
+            "regex; 10 preset-only, ALL the same named, deferred (not fixed here "
+            "— a lane change, out of scope for a view conversion) structural gap: "
+            "the sacrifice clause is embedded inside a CONDITIONAL / MODAL / vote "
+            "/ dice-roll branch phase doesn't decorate as a typed "
+            "`edict_makers`-recognized effect at the unit's top level — a "
+            "Council's-dilemma vote (Capital Punishment, Tyrant's Choice), an "
+            "'unless that player sacrifices' cost-alternative (Demanding Dragon, "
+            "Indulgent Tormentor), a dice-roll modal (Earth-Cult Elemental, "
+            "Myrkul's Edict), or an ETB 'you may choose' branch (Lurking "
+            "Spinecrawler). The same root cause the extra-turns preset's deferred "
+            "residue names (a Time Warp effect nested inside a "
+            "vote/dice/conditional branch is likewise undecorated) — a shared, "
+            "well-understood crosswalk limitation, not several unrelated bugs. 10 "
+            "cards of 183 (recall 0.945) — the view is still correct to ship; "
+            "these are the residual tail."
+        ),
+        keywords=("Annihilator",),
+        signal_keys=("edict_makers",),
+        should_match=("Diabolic Edict",),
+        should_not_match=("Lightning Bolt", "Wrath of God", "Vindicate"),
+    ),
+    # ── Task #83 structural views: same target-type predicate as the
+    # removal family above, bound to the SACRIFICE (edict) shape only —
+    # ``edict_makers``, like ``removal``, emits ``subject=""`` (see that
+    # lane's docstring). No ``generous_any``: a burn spell never forces a
+    # sacrifice, so the "Any" fallback never applies to an edict.
+    Preset(
+        name="creature-edict",
+        description=(
+            "Forced-sacrifice of a creature (Diabolic Edict, Fleshbag "
+            "Marauder, Plaguecrafter, Liliana's Triumph, Sheoldred's "
+            "Edict). Mass forms like Barter in Blood also match. "
+            "Includes 'creature or planeswalker' modals."
+        ),
+        concept=_removal_edict_concept("Creature", family="edict"),
+        should_match=(
+            "Diabolic Edict",
+            "Priest of Forgotten Gods",  # "any number of target players each …"
+            "Papalymo Totolymo",  # phase drops "each opponent" (a ledger row)
+            "Davriel, Soul Broker",  # +1's "they sacrifice an attacking creature"
+            # "may sacrifice a permanent … that shares a card type with it" (its
+            # ruling): the types of what you sacrificed.
+            "Braids, Arisen Nightmare",
+        ),
+        # Devour (CR 702.82a) is a sacrifice YOU make (CR 701.21a): no edict; nor
+        # is a punisher "any player may sacrifice".
+        should_not_match=(
+            "Lightning Bolt",
+            "Shatter",
+            "Sinkhole",
+            "Mycoloth",
+            "Prowling Pangolin",
+            "Brain Gorgers",
+        ),
+    ),
+    Preset(
+        name="artifact-edict",
+        description=(
+            "Forced-sacrifice of an artifact — rare category, mostly "
+            "Tribute to the Wild, Pick Your Poison, Perilous Predicament."
+        ),
+        concept=_removal_edict_concept("Artifact", family="edict"),
+        should_match=("Tribute to the Wild", "Variable Solutions"),
+        should_not_match=("Lightning Bolt", "Diabolic Edict"),
+    ),
+    Preset(
+        name="enchantment-edict",
+        description=(
+            "Forced-sacrifice of an enchantment — rare category "
+            "(Dromoka's Command, Pharika's Libation, Abzan Advantage)."
+        ),
+        concept=_removal_edict_concept("Enchantment", family="edict"),
+        should_match=("Dromoka's Command",),
+        should_not_match=("Lightning Bolt", "Diabolic Edict", "Naturalize"),
+    ),
+    Preset(
+        name="land-edict",
+        description=(
+            "Forced-sacrifice of a land. Includes mass LD like Wildfire, plus "
+            "Smallpox-style combined effects. A land you sacrifice as your own "
+            "cost (Zuran Orb) is not this theme."
+        ),
+        notes=(
+            "Distinct from ``land_sacrifice_makers`` (a YOU-sac cost engine — "
+            "Zuran Orb): this is a FORCED sacrifice a caster inflicts."
+        ),
+        concept=_removal_edict_concept("Land", family="edict"),
+        should_match=(
+            "Wildfire",
+            "Feast of Worms",  # "its controller sacrifices another land"
+            "Tectonic Hellion",  # each player who controls the most lands
+            "Din of the Fireherd",  # "…, then sacrifices a land"
+        ),
+        # Chain of Vapor's "that permanent's controller MAY sacrifice a land".
+        should_not_match=("Lightning Bolt", "Armageddon", "Chain of Vapor"),
+    ),
+    Preset(
+        name="planeswalker-edict",
+        description=(
+            "Forced-sacrifice of a planeswalker — very rare. Usually "
+            "appears as 'sacrifices a creature or planeswalker' in modern "
+            "edict design (Sheoldred's Edict, Angrath's Rampage), so this "
+            "overlaps heavily with creature-edict."
+        ),
+        concept=_removal_edict_concept("Planeswalker", family="edict"),
+        should_match=("Sheoldred's Edict",),
+        # Winter's "you may sacrifice a creature or planeswalker" is your own
+        # sacrifice (CR 701.21a); only its opponents' creature sacrifice is an edict.
+        should_not_match=(
+            "Lightning Bolt",
+            "Diabolic Edict",
+            "Winter, Tormented Loner",
+        ),
+    ),
+    Preset(
+        name="universal-edict",
+        description=(
+            "Forced-sacrifice of any permanent type: a sacrifice filter "
+            "whose bare core-type word is the literal 'Permanent' (Shard "
+            "of the Void Dragon, Martyr's Bond). Unions the Annihilator "
+            "keyword (CR 702.86 — an attack trigger forcing the defender "
+            "to sacrifice N permanents of their choice, a first-class "
+            "Scryfall keyword fact the target-type walk doesn't "
+            "independently reach)."
+        ),
+        keywords=("Annihilator",),
+        concept=_removal_edict_concept("Permanent", family="edict"),
+        should_match=(
+            "Shard of the Void Dragon",
+            "Martyr's Bond",
+            "Fade Away",  # "For each creature, its controller sacrifices"
+            "Liliana of the Veil",  # -6: the pile of their choice
+            "Nicol Bolas, Planeswalker",  # -9: "then sacrifices seven permanents"
+            "Undercity Plague",  # "…, then sacrifices a permanent"
+        ),
+        should_not_match=("Lightning Bolt", "Diabolic Edict", "Wildfire"),
+    ),
+    # ── Land-animation (manlands + Earthbend) ──
+    Preset(
+        name="land-animation",
+        description=(
+            "Turns a land into a creature: manlands (Mutavault, Treetop Village, "
+            "the Restless cycle), animators, and the Awaken (CR 702.113) and "
+            "Earthbend (CR 701.66) keywords."
+        ),
+        notes=(
+            "task #83 structural-view conversion: the concept is DELIBERATELY "
+            "SPLIT across three signal keys (see each lane's own exclusion "
+            "comment): `land_protection` (self-animating manlands — Mutavault, "
+            "Treetop Village, the Restless cycle — deliberately NOT in "
+            "land_creatures_matter; also carries reverse-animators like Ashaya, "
+            "hence prec ~0.66 for this composite) + `land_creatures_matter` "
+            "(anthem/maker land-creature builds) + `earthbend_makers` (the "
+            "Avatar-crossover Earthbend keyword, CR 701.66, prec 1.00) UNION the "
+            "printed `Earthbend` and `Awaken` (CR 702.113 — turns a land you "
+            "control into a creature, the alternative-cost Battle for Zendikar "
+            "mechanic; the whole 15-card Awaken cycle was the entire preset-only "
+            "residue before this union) keywords. Recall 0.88 vs the old regex; "
+            "the remaining 3 preset-only (Gaea's Liege, Graceful Antelope, Tide "
+            "Shaper) are confirmed old-regex false positives — each says "
+            "'...until THIS CREATURE leaves the battlefield' (a duration clause "
+            "referencing the ABILITY's OWN source, a creature), which the old "
+            "regex's lazy 'land...becomes a[^.]*?creature' pattern matched even "
+            "though the land becomes a Forest/Island/Plains (a land TYPE change, "
+            "CR 305.1), never a creature. Signals correctly exclude these; 0 "
+            "genuine losses."
+        ),
+        keywords=("Earthbend", "Awaken"),
+        signal_keys=(
+            "land_protection",
+            "land_creatures_matter",
+            "earthbend_makers",
+        ),
+        should_match=("Mutavault", "Treetop Village"),
+        should_not_match=("Lightning Bolt", "Counterspell", "Sinkhole"),
+    ),
+    # ── Vehicles (Crew) ──
+    Preset(
+        name="crew",
+        description=(
+            "Vehicles with a crew cost — tap creatures with total power "
+            "N or greater to animate the Vehicle until end of turn "
+            "(CR 702.122). Vehicles are a distinct archetype."
+        ),
+        keywords=("Crew",),
+        should_match=("Unicycle",),
+        should_not_match=(
+            "Lightning Bolt",
+            "Kotori, Pilot Prodigy",
+            "Lita, Mechanical Engineer",
+        ),
+    ),
+    # ── Prototype (alt-cost smaller mode) ──
+    Preset(
+        name="prototype",
+        description=(
+            "Cast the card for its prototype cost with different mana "
+            "value, color, and power/toughness — usually a smaller, "
+            "cheaper mode (CR 702.160). The Scryfall layout is also "
+            "'prototype' on these cards."
+        ),
+        keywords=("Prototype",),
+        layouts=("prototype",),
+        should_match=("Blitz Automaton",),
+        should_not_match=("Lightning Bolt", "Blood Beckoning", "Bloodchief's Thirst"),
+    ),
+    # ── Firebending (combat-triggered red mana) ──
+    #
+    # Structural view (task #83): signal keys `firebending_makers` (the
+    # keyword-bearer — the lane reads the caller-supplied Scryfall keyword
+    # array directly, same fact the `keywords=("Firebending",)` arm below
+    # would test) + `firebending_matters` (a keyword-less GRANT of
+    # Firebending — Sozin's Comet, Iroh, Fire Nation Palace/Cadets/Turret —
+    # via `has_structural_firebending_grant` plus a bucket-B
+    # `synth_firebending_matters` tail for grants baked into a make_token
+    # spec's own body). See `_analysis.lanes._bending_lanes`.
+    # `keywords=("Firebending",)` stays as a belt-and-suspenders union (the
+    # landfall precedent): a card with no oracle_id/phase parse degrades the
+    # signal_keys arm to empty exactly like every other regex/keyword arm
+    # does on a field it can't read, so keeping the raw keyword-array test
+    # costs nothing and covers that corner. 1 preset-only residue (per the
+    # lane's own docstring): Firebending Lesson — the card's OWN NAME
+    # contains "Firebending" with zero mechanic relevance; the lane's
+    # narrower structural anchor already sheds this over-catch the deleted
+    # flat regex used to double-count, so this is a regex-over-catch shed,
+    # not a loss.
+    Preset(
+        name="firebending",
+        description=(
+            "Combat-triggered red mana: whenever this creature attacks, "
+            "add N red mana until end of combat (CR 702.189). Avatar "
+            "crossover mechanic."
+        ),
+        keywords=("Firebending",),
+        signal_keys=("firebending_makers", "firebending_matters"),
+        should_match=("Mai and Zuko", "Sozin's Comet"),
+        should_not_match=("Lightning Bolt", "Neheb, the Eternal", "Rakdos Signet"),
+    ),
+    # ── Turn manipulation ──────────────────────────────────────────────
+    # Extra-turn / extra-combat / extra-upkeep payoffs that commander
+    # archetypes (Obeka, Aurelia, Godo, Isshin, Narset) are built around.
+    #
+    # extra-turns task #83/#85 structural-view conversion: CONVERTED
+    # (2026-07-12, phase v0.23.0). The prior deferral found all 9
+    # preset-only residue cards were a genuine recall gap, not a scope/
+    # precision boundary — fixed at the lane, not papered over here:
+    # Chance for Glory / Perch Protection / Ugin's Nexus are a no-node-
+    # at-all static-collapse or ``Unimplemented`` residue phase leaves
+    # zero real ``ExtraTurn`` trace for (a ``tree_synthesis._arm_extra_
+    # turns`` bucket-B idiom scan, gap-gated on
+    # ``crosswalk.has_nested_extra_turn`` finding nothing); Expropriate /
+    # Plea for Power (``Vote.per_choice_effect``), Stitch in Time / Ral
+    # Zarek (``FlipCoin``/``FlipCoins.win_effect``), and Ichormoon
+    # Gauntlet (a static ability's ``GrantAbility.definition``) all carry
+    # a REAL typed ``ExtraTurn`` node the narrow per-unit effect-chain
+    # walk never reached — ``has_nested_extra_turn``'s generic deep-field
+    # walk (the ``has_nested_roll_die``/``has_nested_flip_coin`` precedent)
+    # now reaches all three shapes. See
+    # `_analysis.lanes._extra_turns` for the lane and
+    # `_analysis.tree_synthesis.value_engines._arm_extra_turns` for the synthesis arm.
+    Preset(
+        name="extra-turns",
+        description=(
+            "Take another turn after this one (CR 500.7). Time Walk effects — the "
+            "pillar of Obeka / Narset / Sakashima extra-turns archetypes (Time "
+            "Walk, Temporal Manipulation, Nexus of Fate, Expropriate, Temporal "
+            "Trespass)."
+        ),
+        notes=(
+            "Structural view (task #83/#85): signal key `extra_turns` — an "
+            "ExtraTurn effect, regardless of who takes it (CR 500.7)."
+        ),
+        signal_keys=("extra_turns",),
+        should_match=("Time Walk", "Temporal Manipulation", "Nexus of Fate"),
+        should_not_match=(
+            "Lightning Bolt",
+            "Llanowar Elves",
+            "Stranglehold",
+            "Sundial of the Infinite",
+        ),
+    ),
+    # Illusionist's Gambit fix (task #85, phase v0.23.0): the ``extra_combats``
+    # signal now reads the ``illusionists_gambit_additional_combat_swallowed``
+    # ledgered bridge (`_analysis.bridge_ledger`) — the ``Condition_If``
+    # SwallowedClause parse-warning on "After this phase, there is an
+    # additional combat phase" was STILL unstructured at v0.23.0 (unchanged
+    # since v0.20.0), so this stays a bridge (an upstream_parse_failure,
+    # not a forced arm) rather than a real typed node.
+    Preset(
+        name="extra-combats",
+        description=(
+            "Additional combat phase (CR 506). Aggravated Assault, Seize the Day, "
+            "Waves of Aggression — the pillar of Aurelia / Godo / Isshin "
+            "commander archetypes and multi-combat 60-card lists."
+        ),
+        notes=(
+            "Structural view (task #83): signal key `extra_combats` — an "
+            "AdditionalPhase effect whose phase is a combat phase (see "
+            "`_analysis.lanes._extra_combats`)."
+        ),
+        signal_keys=("extra_combats",),
+        should_match=("Aggravated Assault", "Seize the Day", "Waves of Aggression"),
+        should_not_match=("Lightning Bolt", "Serra Angel"),
+    ),
+    Preset(
+        name="extra-upkeeps",
+        description=(
+            "Additional upkeep step. Paradox Haze and Obeka, Splitter of Seconds "
+            "turn beginning-of-upkeep triggers into repeatable engines — the core "
+            "of upkeep-payoff archetypes. Also an additional beginning phase "
+            "(Sphinx of the Second Sun), which includes an upkeep step (CR "
+            "501.1)."
+        ),
+        notes=(
+            "The crosswalk `extra_upkeep` signal also folds in the wider "
+            "'additional beginning phase' idiom (Sphinx of the Second Sun) — a "
+            "beginning phase INCLUDES the upkeep step (CR 501.1), so it's the "
+            "same archetype under a broader templating (task #83 structural-view "
+            "conversion)."
+        ),
+        signal_keys=("extra_upkeep",),
+        should_match=("Obeka, Splitter of Seconds", "Paradox Haze"),
+        should_not_match=(
+            "Lightning Bolt",
+            "Llanowar Elves",
+            "Phyrexian Arena",
+            "Howling Mine",
+        ),
+    ),
+    # ── Blink / ETB abuse ──────────────────────────────────────────────
+    # Exile-then-return-to-battlefield cards that re-trigger enter-the-
+    # battlefield effects. task #83 structural-view conversion: the
+    # ``blink_flicker`` key is shared by TWO producers (the literal
+    # exile-and-return MAKER, always HIGH confidence, and
+    # apply_membership_floor's "worth blinking" payoff cross-open off a
+    # card's own strong ETB value — Academy Journeymage/Mulldrifter,
+    # always LOW) — a raw signal_keys union would catch both, cratering
+    # precision (the task #83 preset-scoping pass measured .06 over the
+    # raw union). ``_blink_maker_concept`` filters to the MAKER half only
+    # (lanes.blink_flicker_maker_present /
+    # blink_flicker_is_maker). ``self_blink`` (a card exiling and
+    # returning ITSELF — Aetherling — a genuinely different self-flicker
+    # engine, CR 611.2b) unions in as a separate arm; the old regex's
+    # "exile ... until this creature leaves the battlefield" (Angel of
+    # Sanctions — exile + battlefield but no return) never matched either
+    # arm, matching the regex's own should_not_match fixture.
+    Preset(
+        name="blink",
+        description=(
+            "ETB abuse: exile then return to the battlefield. Soulherder, "
+            "Ephemerate, Eldrazi Displacer, Conjurer's Closet, "
+            "Restoration Angel — re-trigger enter-the-battlefield effects "
+            "by flickering creatures in and out of exile."
+        ),
+        signal_keys=("self_blink",),
+        concept=_blink_maker_concept,
+        should_match=("Soulherder", "Ephemerate", "Conjurer's Closet"),
+        should_not_match=("Lightning Bolt", "Angel of Sanctions"),
+    ),
+    # Open type-of-choice tribal payoffs (task B-1 / verified-review F5):
+    # choose a creature type as it enters (CR 614.12) and REWARD the chosen
+    # type. Structural-only on purpose — a text arm ("choose a creature
+    # type") would re-admit the punisher choosers (Engineered Plague) the
+    # chosen_type_matters lane's emission gates exclude.
+    Preset(
+        name="chosen-type-payoff",
+        description=(
+            "Open type-of-choice tribal payoffs — choose a creature type as "
+            "it enters and reward the chosen type (Door of Destinies, "
+            "Herald's Horn, Kindred Discovery). Serve whatever tribe the "
+            "deck fields."
+        ),
+        signal_keys=("chosen_type_matters",),
+        should_match=("Door of Destinies", "Herald's Horn"),
+        should_not_match=("Engineered Plague",),
+    ),
+)
+
+
+def _build_registry() -> MappingProxyType[str, Preset]:
+    """Construct the immutable PRESETS registry."""
+    all_presets = _EVERGREEN_KEYWORDS + _KEYWORD_ABILITIES + _FUNCTIONAL_PRESETS
+    names_seen: dict[str, Preset] = {}
+    for p in all_presets:
+        if p.name in names_seen:
+            msg = f"duplicate preset name: {p.name!r}"
+            raise ValueError(msg)
+        names_seen[p.name] = p
+    return MappingProxyType(names_seen)
+
+
+PRESETS: MappingProxyType[str, Preset] = _build_registry()
+
+
+def get_preset(name: str) -> Preset:
+    """Look up a preset by name. Raises KeyError if unknown."""
+    try:
+        return PRESETS[name]
+    except KeyError as exc:
+        msg = f"unknown preset {name!r}. Known: {', '.join(sorted(PRESETS.keys()))}"
+        raise KeyError(msg) from exc
+
+
+def matches(name: str, card: dict) -> bool:
+    """Convenience wrapper: ``get_preset(name).matches(card)``."""
+    return get_preset(name).matches(card)
+
+
+def list_presets() -> dict[str, str]:
+    """Return ``name -> description`` for every preset, sorted by name."""
+    return {name: PRESETS[name].description for name in sorted(PRESETS)}

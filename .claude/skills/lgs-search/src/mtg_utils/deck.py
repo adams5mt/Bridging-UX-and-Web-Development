@@ -1,0 +1,325 @@
+"""Deck-shape walks + card-record helpers.
+
+Shared by ``proxy_print``, ``art_fetcher``, and (in time) any other CLI
+that consumes the parsed deck JSON. Centralising these helpers in one
+module stops consumers from reaching into ``proxy_print``'s privates
+and gives the deck-walking vocabulary a discoverable home.
+
+The deck JSON shape (produced by ``parse-deck``)::
+
+    {
+      "format": "commander",
+      "commanders": [{"name": ..., "quantity": ...}],
+      "cards": [{"name": ..., "quantity": ...}],
+      "sideboard": [{"name": ..., "quantity": ...}],
+    }
+
+Each entry's ``quantity`` is optional (defaults to 1). Section lists
+themselves may be missing.
+"""
+
+from __future__ import annotations
+
+import re
+from collections import Counter
+from collections.abc import Mapping
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from mtg_utils._name_index import NameIndex
+from mtg_utils.card_classify import (
+    color_sources,
+    is_creature,
+    is_land,
+    land_fetch_profile,
+)
+from mtg_utils.card_pool import CardPool
+from mtg_utils.names import normalize_card_name
+from mtg_utils.names import slug as slug  # noqa: PLC0414 (re-export; home is names.py)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
+
+    from mtg_utils._analysis.roles import DeckMana
+
+
+# Card-type words used as fallback art keys after subtypes miss; also
+# part of the keyword filter that decides which asciiart.website tags
+# to fetch.
+CARD_TYPE_WORDS: frozenset[str] = frozenset(
+    {
+        "creature",
+        "artifact",
+        "enchantment",
+        "land",
+        "sorcery",
+        "instant",
+        "planeswalker",
+        "battle",
+    }
+)
+
+
+def split_type_line(type_line: str) -> tuple[list[str], list[str]]:
+    """Return ``(card_types, subtypes)`` split on em-dash.
+
+    >>> split_type_line("Legendary Creature — Vampire Knight")
+    (['legendary', 'creature'], ['vampire', 'knight'])
+    >>> split_type_line("Sorcery")
+    (['sorcery'], [])
+    """
+    if not type_line:
+        return [], []
+    parts = re.split(r"\s+[—\-]\s+", type_line, maxsplit=1)
+    types_part = parts[0].strip()
+    subs_part = parts[1].strip() if len(parts) > 1 else ""
+    types = [w.lower() for w in types_part.split() if w]
+    subs = [w.lower() for w in subs_part.split() if w]
+    return types, subs
+
+
+def hydrate(card: dict) -> dict:
+    """Materialize a renderable view of a Scryfall card.
+
+    Joins ``card_faces`` for split / MDFC / transform layouts so callers
+    see both halves' oracle text, mana costs, and type lines as ``a //
+    b`` strings. Returns a shallow-copy dict; ``card`` is not mutated.
+    """
+    out = dict(card)
+    faces = card.get("card_faces") or []
+    if faces and not out.get("oracle_text"):
+        out["oracle_text"] = "\n//\n".join(f.get("oracle_text") or "" for f in faces)
+    if faces and not out.get("mana_cost"):
+        out["mana_cost"] = " // ".join(f.get("mana_cost") or "" for f in faces)
+    if faces and not out.get("type_line"):
+        out["type_line"] = " // ".join(f.get("type_line") or "" for f in faces)
+    return out
+
+
+#: The zones whose cards a builder must own to play the deck: the commanders, the
+#: main deck, the sideboard and the companion (never an opened pool).
+OWNED_ZONES: tuple[str, ...] = ("commanders", "cards", "sideboard", "companion")
+
+
+def deck_entries(deck: Mapping, zones: tuple[str, ...] = OWNED_ZONES) -> list[dict]:
+    """Every well-formed entry (a dict with a string ``name``) in ``zones``, in zone
+    then deck order — the one walk the ownership readers share."""
+    return [
+        entry
+        for zone in zones
+        for entry in deck.get(zone) or []
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+    ]
+
+
+def walk_cards(
+    deck: dict,
+    *,
+    include_sideboard: bool,
+    copies: int,
+) -> list[tuple[str, int]]:
+    """Return ``[(card_name, total_quantity)]`` in deck order.
+
+    Iterates ``commanders + cards + sideboard`` (sideboard skipped if
+    ``include_sideboard`` is False). ``copies`` multiplies every quantity.
+    """
+    sections: list[list[dict]] = [
+        deck.get("commanders") or [],
+        deck.get("cards") or [],
+    ]
+    if include_sideboard:
+        sections.append(deck.get("sideboard") or [])
+
+    out: list[tuple[str, int]] = []
+    for section in sections:
+        for entry in section:
+            name = entry.get("name") or ""
+            raw_qty = entry.get("quantity")
+            try:
+                base_qty = 1 if raw_qty is None else int(raw_qty)
+            except (TypeError, ValueError):
+                # One malformed quantity ("2.0", a stray dict) degrades to 1 rather
+                # than aborting the whole walk (mirrors mark_owned._collect_entries).
+                base_qty = 1
+            qty = base_qty * copies
+            if name and qty > 0:
+                out.append((name, qty))
+    return out
+
+
+def discover_tokens(
+    deck: dict,
+    by_name: NameIndex,
+    by_id: dict[str, dict],
+    *,
+    log_warn: Callable[[str], None],
+) -> list[dict]:
+    """Walk every card, follow ``all_parts`` to its tokens, dedupe by oracle_id.
+
+    Returns a list of token records
+    ``{"token": <hydrated>, "sources": [card-names]}`` sorted artifacts →
+    W/U/B/R/G/C → name. ``log_warn`` receives one message per missing
+    source card or unresolvable token id.
+    """
+    color_order = {"W": 1, "U": 2, "B": 3, "R": 4, "G": 5, "C": 6}
+
+    by_oid: dict[str, dict] = {}
+    for section in ("commanders", "cards", "sideboard"):
+        for entry in deck.get(section) or []:
+            name = entry.get("name") or ""
+            if not name:
+                continue
+            src = by_name.get(name.lower())
+            if src is None:
+                log_warn(f"missing from bulk: {name}")
+                continue
+            for part in src.get("all_parts") or []:
+                if part.get("component") != "token":
+                    continue
+                pid = part.get("id")
+                token = by_id.get(pid) if pid else None
+                if token is None:
+                    log_warn(f"token id {pid} from {name}")
+                    continue
+                oid = token.get("oracle_id") or pid or token.get("name") or ""
+                group = by_oid.get(oid)
+                if group is None:
+                    by_oid[oid] = {
+                        "token": hydrate(token),
+                        "sources": [name],
+                    }
+                else:
+                    group["sources"].append(name)
+
+    def sort_key(rec: dict) -> tuple:
+        t = rec["token"]
+        is_artifact = "Artifact" in (t.get("type_line") or "")
+        cs = t.get("colors") or t.get("color_indicator") or []
+        col = cs[0] if cs else "C"
+        return (not is_artifact, color_order.get(col, 9), t.get("name") or "")
+
+    return sorted(by_oid.values(), key=sort_key)
+
+
+def load_bulk_indexes(bulk_path: Path) -> tuple[NameIndex, dict[str, dict]]:
+    """``(by_name, by_id)`` for the proxy / art path — the ``CardPool``'s indexes
+    (ADR-0046): ``by_name`` resolves a deck name to one game-layout printing (never a
+    token, a text-bearing printing preferred); ``by_id`` includes EVERYTHING, tokens
+    included, to resolve ``all_parts`` token references."""
+    pool = CardPool.load(bulk_path)
+    return pool.by_name, pool.by_id
+
+
+def accumulate_deck_metrics(
+    pairs: Iterable[tuple[int, dict | None]],
+    *,
+    deck_mana: DeckMana | None = None,
+) -> dict:
+    """Single-pass deck metrics over ``(quantity, card-record-or-None)`` pairs.
+
+    The shared accumulation behind ``deck_stats`` and ``deck_diff`` (land /
+    creature / ramp / game-changer counts, CMC curve, color sources, and the
+    nonland-CMC average). Returns raw values — Counters and an unrounded
+    ``avg_cmc`` — so each caller formats as it needs. A ``None`` record (an
+    un-hydratable name) counts toward ``total`` only. Ramp is judged under
+    ``deck_mana`` (``hd.deck_mana``): a rock whose mana is dead for it isn't ramp.
+    """
+    # Lazy: this module is also proxy-print's / fetch-art's deck walk, which must not
+    # pay for the analysis stack on import.
+    from mtg_utils._analysis.roles import is_ramp
+
+    total = 0
+    land_count = creature_count = ramp_count = game_changer_count = 0
+    nonland_cmcs: list[float] = []
+    curve: Counter[int] = Counter()
+    sources: Counter[str] = Counter()
+    for qty, card in pairs:
+        total += qty
+        if card is None:
+            continue
+        if is_land(card):
+            land_count += qty
+        else:
+            cmc = float(card.get("cmc") or 0)
+            nonland_cmcs.extend([cmc] * qty)
+            curve[int(cmc)] += qty
+        if is_creature(card):
+            creature_count += qty
+        if is_ramp(card, deck_mana=deck_mana):
+            ramp_count += qty
+        if card.get("game_changer"):
+            game_changer_count += qty
+        # A land whose only "mana ability" is sacrificing itself to find a basic
+        # (Evolving Wilds, Hobbit Hole) is not an any-color source: it taps for
+        # nothing and converts into a basic a turn later. Reporting it as `any`
+        # overstated the manabase — bucket it separately so the count is honest.
+        direct = [c for c in (card.get("produced_mana") or []) if c in "WUBRG"]
+        if is_land(card) and not direct and land_fetch_profile(card) is not None:
+            sources["fetch"] += qty
+            continue
+        for color in color_sources(card):
+            sources[color] += qty
+    avg_cmc = sum(nonland_cmcs) / len(nonland_cmcs) if nonland_cmcs else 0.0
+    return {
+        "total": total,
+        "land_count": land_count,
+        "creature_count": creature_count,
+        "ramp_count": ramp_count,
+        "game_changer_count": game_changer_count,
+        "avg_cmc": avg_cmc,
+        "curve": curve,
+        "color_sources": sources,
+    }
+
+
+def collect_card_entries(
+    deck: dict,
+    *,
+    include_sideboard: bool = True,
+    reconcile: str = "max",
+    min_quantity: int | None = None,
+) -> dict[str, tuple[str, int]]:
+    """Walk a parsed deck into ``{normalized-name: (original-name, quantity)}``.
+
+    Shared by ``mark_owned`` (ownership index — sums a card's split printings) and
+    ``find_commanders`` (owned index — ``max``-reconciles, filters by min_quantity).
+    Both keyed via the canonical ``normalize_card_name`` so Unicode folding is
+    consistent across the two tools (drift here silently corrupts the ownership
+    intersection). The original-case name is kept for display.
+
+    - ``reconcile`` — ``"sum"`` adds duplicate quantities (a collection export splits
+      one card across printings), ``"max"`` takes the largest (parse-deck can echo a
+      commander in both ``commanders`` and ``cards`` — the same physical copy).
+    - ``min_quantity`` — drop entries below it; ``None`` keeps every entry (including
+      quantity 0, as the ownership index does).
+
+    ``price_check`` deliberately does NOT use this: it keys on a non-folded
+    ``name.lower()``, preserves first-appearance order, returns a list, and accepts a
+    bare name list — a different contract.
+    """
+    sections = ["commanders", "cards"]
+    if include_sideboard:
+        sections.append("sideboard")
+    out: dict[str, tuple[str, int]] = {}
+    for section in sections:
+        for entry in deck.get(section, []) or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            try:
+                raw = entry.get("quantity")
+                qty = 1 if raw is None else int(raw)
+            except (TypeError, ValueError):
+                qty = 1
+            if min_quantity is not None and qty < min_quantity:
+                continue
+            existing = out.get(key := normalize_card_name(name))
+            if existing is None:
+                out[key] = (name, qty)
+            elif reconcile == "sum":
+                out[key] = (existing[0], existing[1] + qty)
+            else:
+                out[key] = (existing[0], max(existing[1], qty))
+    return out
