@@ -77,5 +77,29 @@
       "height_mm": 32,
       "look": "A heavily muscled orc woman with grey-green skin, small tusks, a shaggy grey mane of hair and a ragged bite scar on her forearm. She wears a grey wolf-pelt mantle over bare shoulders, a rough homespun tunic and trousers, leather bracers and boots, and no armor. She holds a large greataxe diagonally across her body with both hands, a long wolf's fang hangs on a cord at her neck and two handaxes hang from her belt."
     }
+  ],
+  "monster_style": "32mm tabletop miniature concept art, gothic horror (Curse of Strahd). Full body, front three-quarter view, plain white background, even lighting, painted-miniature look. Sculpted as solid, chunky smoke forms thick enough to 3D print: no floating wisps or thin strands. The lower body flows into a broad pool of swirling shadow on the ground that anchors it. No base, no scenery. Painted deep charcoal and black with cold violet-grey highlights so the sculpted form stays readable.",
+  "monsters": [
+    {
+      "id": "shadow-a",
+      "name": "Shadow (stalker)",
+      "summary": "Shadow, Death House shrine. Print two.",
+      "height_mm": 30,
+      "look": "A Shadow, the D&D undead: a gaunt, featureless humanoid silhouette made of living darkness with two faint pale eyes, long spindly arms ending in hooked claws, hunched and stalking forward. Below the waist its body dissolves into rolling smoke."
+    },
+    {
+      "id": "shadow-b",
+      "name": "Shadow (cultist shade)",
+      "summary": "Shadow, Death House shrine. Print two.",
+      "height_mm": 30,
+      "look": "The shadow of a dead cultist from Death House: a hooded, robed humanoid made entirely of living darkness, faceless under the deep hood except for two dim pale eyes, one long clawed hand reaching out, its tattered robe hem melting into smoke."
+    },
+    {
+      "id": "shadow-d",
+      "name": "Shadow (stretched)",
+      "summary": "Shadow, Death House shrine. Print two.",
+      "height_mm": 30,
+      "look": "A Shadow, the D&D undead, shaped like a person's shadow peeled off a wall: unnaturally tall and thin with elongated limbs, head tilted, one long arm raised with splayed claw fingers, a smooth featureless surface with two faint pale eyes, its feet smearing into a dark puddle of smoke."
+    }
   ]
 }

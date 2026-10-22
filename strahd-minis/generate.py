@@ -66,16 +66,20 @@ def download(url, dest):
 
 
 def character(cid):
-    return next(c for c in SPEC["characters"] if c["id"] == cid)
+    return next(c for c in SPEC["characters"] + SPEC["monsters"] if c["id"] == cid)
+
+
+def prompt_for(cid):
+    style = SPEC["monster_style"] if any(m["id"] == cid for m in SPEC["monsters"]) else SPEC["style"]
+    return f"{character(cid)['look']} {style}"
 
 
 def concept(cid, state):
     s = state.setdefault(cid, {})
     if "concept_task" not in s:
-        prompt = f"{character(cid)['look']} {SPEC['style']}"
         s["concept_task"] = call("POST", "/v1/text-to-image", {
             "ai_model": IMAGE_MODEL,
-            "prompt": prompt,
+            "prompt": prompt_for(cid),
             "aspect_ratio": "3:4",
         })["result"]
         save_state(state)

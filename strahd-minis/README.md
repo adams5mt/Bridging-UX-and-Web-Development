@@ -17,6 +17,16 @@ Every figure stands on the same base: a 25 mm round, 3.5 mm tall, with a bevelle
 | Elowen Ashgrave | High Elf Ranger | 30 mm |
 | Volen Graymane | Orc Barbarian | 32 mm |
 
+## Monsters
+
+The six shadows in the Darklord's shrine use three designs, printed twice each. They stand on the same 25 mm base at 30 mm tall.
+
+| Model | Design |
+|---|---|
+| `shadow-a` | Stalker: a hunched figure rising from a column of smoke |
+| `shadow-b` | Cultist shade: a hooded, robed figure reaching out |
+| `shadow-d` | Stretched: a tall, thin figure with one arm raised. The arm is thin, so resin prints it best. |
+
 ## Files
 
 In `out/<id>/`:
@@ -31,7 +41,7 @@ The `out/models.png`, `out/based.png` and `out/concepts.png` sheets show all ten
 
 ## How they were made
 
-`characters.json` holds a shared style prompt, the base size, and a look and height for each character. The looks are drawn from each character's class, species, background, gear and relic.
+`characters.json` holds a shared style prompt, the base size, and a look and height for each character and monster. The looks are drawn from each character's class, species, background, gear and relic.
 
 `generate.py` runs three steps for each character:
 

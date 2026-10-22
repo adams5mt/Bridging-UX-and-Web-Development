@@ -38,5 +38,17 @@
   "volen": {
     "concept_task": "01a16185-1668-7080-af1c-75a07decaea8",
     "model_task": "01a16185-efcf-7430-ad3d-f294e3de1d67"
+  },
+  "shadow-a": {
+    "concept_task": "01a16329-7574-7765-b7f4-41bc7fc7448a",
+    "model_task": "01a1632c-16fe-71bd-9e67-419d4bbdcaba"
+  },
+  "shadow-b": {
+    "concept_task": "01a16329-76e2-74d6-80bb-60ddeb8c4260",
+    "model_task": "01a1632c-1b10-76a0-bc45-38f2bfbd822f"
+  },
+  "shadow-d": {
+    "concept_task": "01a16329-7986-7592-87e1-dd0b4cd9c200",
+    "model_task": "01a1632c-1f41-776e-9986-4686a34b4e19"
   }
 }
